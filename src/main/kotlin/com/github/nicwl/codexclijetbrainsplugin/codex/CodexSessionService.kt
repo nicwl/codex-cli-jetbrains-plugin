@@ -34,6 +34,18 @@ interface CodexEventListener {
     fun onReasoningEnd() {}
     // MCP tools
     fun onMcpToolsListed(tools: Map<String, String>) {}
+
+    // Exec command streaming (chat bubble console)
+    fun onExecCommandBegin(callId: String, commandDisplay: String) {}
+    fun onExecCommandOutputDelta(callId: String, isStdErr: Boolean, bytes: ByteArray) {}
+    fun onExecCommandEnd(
+        callId: String,
+        exitCode: Int,
+        durationSecs: Long,
+        durationNanos: Int,
+        stdout: String,
+        stderr: String,
+    ) {}
 }
 
 @Service(Service.Level.PROJECT)
@@ -272,6 +284,44 @@ class CodexSessionService(private val project: Project) : Disposable, CodexTrans
 
             is EventMsg.ExecApprovalRequest -> {
                 listeners.forEach { l -> safeSwing { l.onExecApprovalRequest(id, msg.command, msg.cwd, msg.reason) } }
+            }
+
+            is EventMsg.ExecCommandBegin -> {
+                val display = runCatching {
+                    // Prefer parsed_cmd (first element's `cmd`), otherwise join raw command list
+                    val first = msg.parsedCmd.firstOrNull()
+                    when (first) {
+                        is EventMsg.ParsedCommand.Read -> first.cmd
+                        is EventMsg.ParsedCommand.ListFiles -> first.cmd
+                        is EventMsg.ParsedCommand.Search -> first.cmd
+                        is EventMsg.ParsedCommand.Format -> first.cmd
+                        is EventMsg.ParsedCommand.Test -> first.cmd
+                        is EventMsg.ParsedCommand.Lint -> first.cmd
+                        is EventMsg.ParsedCommand.Noop -> first.cmd
+                        is EventMsg.ParsedCommand.Unknown -> first.cmd
+                        null -> msg.command.joinToString(" ")
+                    }
+                }.getOrElse { msg.command.joinToString(" ") }
+                listeners.forEach { l -> safeSwing { l.onExecCommandBegin(msg.callId, display) } }
+            }
+
+            is EventMsg.ExecCommandOutputDelta -> {
+                val isErr = msg.stream == EventMsg.ExecOutputStream.Stderr
+                val bytes = msg.chunk.toByteArray()
+                listeners.forEach { l -> safeSwing { l.onExecCommandOutputDelta(msg.callId, isErr, bytes) } }
+            }
+
+            is EventMsg.ExecCommandEnd -> {
+                listeners.forEach { l -> safeSwing {
+                    l.onExecCommandEnd(
+                        msg.callId,
+                        msg.exitCode,
+                        msg.duration.secs,
+                        msg.duration.nanos,
+                        msg.stdout,
+                        msg.stderr,
+                    )
+                } }
             }
 
             is EventMsg.ApplyPatchApprovalRequest -> {

@@ -12,5 +12,6 @@
         <toolWindow factoryClass="com.github.nicwl.codexclijetbrainsplugin.toolWindow.CodexToolWindowFactory" id="Codex" anchor="right"/>
         <applicationConfigurable instance="com.github.nicwl.codexclijetbrainsplugin.settings.CodexSettingsConfigurable" id="com.github.nicwl.codex.settings" displayName="Codex CLI"/>
         <notificationGroup id="Codex Notifications" displayType="BALLOON" isLogByDefault="true"/>
+        <completion.contributor language="ANY" implementationClass="com.github.nicwl.codexclijetbrainsplugin.completion.SlashCommandCompletionContributor" order="first"/>
     </extensions>
 </idea-plugin>

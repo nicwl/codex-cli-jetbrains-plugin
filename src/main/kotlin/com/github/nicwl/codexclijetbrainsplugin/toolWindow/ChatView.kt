@@ -1,25 +1,43 @@
 package com.github.nicwl.codexclijetbrainsplugin.toolWindow
 
+import com.intellij.execution.process.AnsiEscapeDecoder
+import com.intellij.execution.process.ProcessOutputType
+import com.intellij.execution.ui.ConsoleViewContentType
+import com.intellij.openapi.project.Project
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBScrollPane
+import com.intellij.ui.components.JBScrollBar
 import com.intellij.util.ui.JBUI
 import java.awt.*
 import java.awt.event.ComponentAdapter
 import java.awt.event.ComponentEvent
 import javax.swing.*
 
-class ChatView : JPanel(BorderLayout()) {
+class ChatView(private val project: Project) : JPanel(BorderLayout()) {
     private val content = JPanel()
-    private val scroll = JBScrollPane(content, ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED, ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER)
+    private val scroll = JBScrollPane(content, ScrollPaneConstants.VERTICAL_SCROLLBAR_ALWAYS, ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER)
 
     private var currentAssistant: MessageBubble? = null
     private var currentReasoning: MessageBubble? = null
+    private val execConsoles = mutableMapOf<String, ConsoleBubble>()
     private val bubbles = mutableListOf<MessageBubble>()
 
     init {
         content.layout = BoxLayout(content, BoxLayout.Y_AXIS)
         content.border = JBUI.Borders.empty(8)
         add(scroll, BorderLayout.CENTER)
+
+        // Use custom ScrollBar UI to keep thumbs always visible (avoid macOS overlay auto-hide)
+        scroll.verticalScrollBar = JBScrollBar(Adjustable.VERTICAL).apply {
+            isOpaque = false
+            unitIncrement = JBUI.scale(16)
+            ui = AlwaysPaintThumbUI()
+        }
+        scroll.horizontalScrollBar = JBScrollBar(Adjustable.HORIZONTAL).apply {
+            isOpaque = false
+            unitIncrement = JBUI.scale(16)
+            ui = AlwaysPaintThumbUI()
+        }
 
         // Recompute bubble widths on resize
         content.addComponentListener(object : ComponentAdapter() {
@@ -158,6 +176,36 @@ class ChatView : JPanel(BorderLayout()) {
         addNote(sb.toString())
     }
 
+    // ───────── Exec command console bubble (ANSI-aware) ─────────
+    fun beginExecConsole(callId: String, commandDisplay: String) {
+        if (execConsoles.containsKey(callId)) return
+        val console = ConsoleBubble(commandDisplay, project)
+        execConsoles[callId] = console
+        content.add(console.row)
+        refreshConsole(console)
+        revalidateAndScroll()
+    }
+
+    fun appendExecConsoleDelta(callId: String, isStdErr: Boolean, bytes: ByteArray) {
+        val c = execConsoles[callId] ?: run {
+            // If we somehow get output before begin, create a generic console
+            val fallback = ConsoleBubble("(process output)", project)
+            execConsoles[callId] = fallback
+            content.add(fallback.row)
+            fallback
+        }
+        c.appendBytes(bytes, isStdErr)
+        refreshConsole(c)
+        revalidateAndScroll()
+    }
+
+    fun endExecConsole(callId: String, exitCode: Int, durationSecs: Long, durationNanos: Int) {
+        val c = execConsoles.remove(callId) ?: return
+        c.appendFooter("[exit code: $exitCode; duration: ${durationSecs}s ${durationNanos}ns]")
+        refreshConsole(c)
+        revalidateAndScroll()
+    }
+
     private fun revalidateAndScroll() {
         // Compute bubble sizes immediately to avoid initial oversized height
         updateBubbleWidths()
@@ -173,6 +221,7 @@ class ChatView : JPanel(BorderLayout()) {
         val containerW = scroll.viewport.extentSize.width.takeIf { it > 0 } ?: content.width
         val available = (containerW * 0.9).toInt().coerceAtLeast(200)
         bubbles.forEach { it.setMaxWidth(available) }
+        execConsoles.values.forEach { it.setMaxWidth(available) }
         content.revalidate()
         content.repaint()
     }
@@ -181,6 +230,12 @@ class ChatView : JPanel(BorderLayout()) {
         val containerW = scroll.viewport.extentSize.width.takeIf { it > 0 } ?: content.width
         val available = (containerW * 0.9).toInt().coerceAtLeast(200)
         b.setMaxWidth(available)
+    }
+
+    private fun refreshConsole(c: ConsoleBubble) {
+        val containerW = scroll.viewport.extentSize.width.takeIf { it > 0 } ?: content.width
+        val available = (containerW * 0.9).toInt().coerceAtLeast(200)
+        c.setMaxWidth(available)
     }
 
     enum class Role { User, Assistant, Note, Error, Diff, Status, Reasoning }
@@ -285,6 +340,190 @@ class ChatView : JPanel(BorderLayout()) {
             panel.preferredSize = Dimension(bubbleWidth, panelPrefH)
             panel.maximumSize = Dimension(bubbleWidth, panelPrefH)
             row.maximumSize = Dimension(Int.MAX_VALUE, panelPrefH)
+            panel.revalidate()
+            panel.repaint()
+        }
+    }
+
+    // Minimal ANSI-aware console bubble with max height + scroll
+    inner class ConsoleBubble(commandDisplay: String, private val project: Project? = null) {
+        val row = JPanel()
+        private val panel = JPanel(BorderLayout())
+        private val inner = JPanel(BorderLayout())
+        private val header = JLabel()
+        private val text = JTextPane()
+        private val doc = text.styledDocument
+        private val scroll = JBScrollPane(
+            text,
+            ScrollPaneConstants.VERTICAL_SCROLLBAR_ALWAYS,
+            ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED
+        )
+        private val footer = JLabel()
+        private val ansi = AnsiEscapeDecoder()
+
+        // Incremental UTF-8 decoding support
+        private var pendingUtf8 = ByteArray(0)
+        // ANSI sequence pending (if chunk ended mid-sequence)
+        private var pendingAnsi: String = ""
+
+        // Current SGR style
+        // base style is handled by ConsoleView; stderr vs stdout is controlled by initial key
+
+        // Config
+        private val maxHeight = JBUI.scale(240)
+
+        init {
+            row.isOpaque = false
+            row.layout = BoxLayout(row, BoxLayout.X_AXIS)
+
+            val bgPanel = JBColor(0x111111, 0x1E1E1E)
+            inner.background = bgPanel
+            inner.border = JBUI.Borders.compound(
+                JBUI.Borders.customLine(JBColor.border(), 1),
+                JBUI.Borders.empty(6, 8)
+            )
+
+            header.text = commandDisplay
+            header.foreground = JBColor(0xB8B8B8, 0xA8A8A8)
+            header.font = Font(Font.MONOSPACED, Font.BOLD, UIManager.getFont("Label.font").size)
+            header.border = JBUI.Borders.compound(
+                JBUI.Borders.customLine(JBColor.border(), 0, 0, 1, 0),
+                JBUI.Borders.empty(0, 0, 6, 0)
+            )
+
+            text.isEditable = false
+            text.background = bgPanel
+            text.foreground = JBColor(0xF0F0F0, 0xE6E6E6)
+            text.font = Font(Font.MONOSPACED, Font.PLAIN, UIManager.getFont("Label.font").size)
+
+            scroll.border = null
+            scroll.isOpaque = false
+            scroll.viewport.isOpaque = false
+            // Replace scrollbars with variants that always paint a visible thumb
+            scroll.verticalScrollBar = JBScrollBar(Adjustable.VERTICAL).apply {
+                isOpaque = false
+                unitIncrement = JBUI.scale(16)
+                ui = AlwaysPaintThumbUI()
+            }
+            scroll.horizontalScrollBar = JBScrollBar(Adjustable.HORIZONTAL).apply {
+                isOpaque = false
+                unitIncrement = JBUI.scale(16)
+                ui = AlwaysPaintThumbUI()
+            }
+
+            inner.add(header, BorderLayout.NORTH)
+            inner.add(scroll, BorderLayout.CENTER)
+
+            footer.foreground = JBColor(0x9AA0A6, 0x868686)
+            footer.font = Font(
+                Font.MONOSPACED,
+                Font.PLAIN,
+                (UIManager.getFont("Label.font").size - 1).coerceAtLeast(10)
+            )
+            footer.border = JBUI.Borders.emptyTop(6)
+            inner.add(footer, BorderLayout.SOUTH)
+
+            panel.isOpaque = false
+            panel.add(inner, BorderLayout.WEST)
+            panel.border = JBUI.Borders.empty(4, 0)
+            panel.alignmentX = Component.LEFT_ALIGNMENT
+
+            row.add(panel)
+            row.add(Box.createHorizontalGlue())
+        }
+
+        fun setMaxWidth(maxWidth: Int) {
+            // Width similar to message bubbles
+            val innerInsets = inner.border?.getBorderInsets(inner) ?: Insets(0, 0, 0, 0)
+            val panelInsets = panel.border?.getBorderInsets(panel) ?: Insets(0, 0, 0, 0)
+
+            val bubbleWidth = maxWidth
+
+            // Compute text preferred height at this width
+            val wrapWidth = (bubbleWidth - innerInsets.left - innerInsets.right).coerceAtLeast(60)
+            text.size = Dimension(wrapWidth, 100_000)
+            val contentH = text.preferredSize.height
+            val desiredViewportH = contentH.coerceAtMost(maxHeight)
+
+            val totalH = desiredViewportH + header.preferredSize.height + footer.preferredSize.height + innerInsets.top + innerInsets.bottom + panelInsets.top + panelInsets.bottom + JBUI.scale(1)
+            panel.preferredSize = Dimension(bubbleWidth, totalH)
+            panel.maximumSize = Dimension(bubbleWidth, totalH)
+            row.maximumSize = Dimension(Int.MAX_VALUE, totalH)
+            panel.revalidate()
+            panel.repaint()
+        }
+
+        fun appendBytes(bytes: ByteArray, isStdErr: Boolean) {
+            val combined = if (pendingUtf8.isNotEmpty()) pendingUtf8 + bytes else bytes
+            // Try decode; keep up to last 3 bytes as pending if needed
+            val (decoded, remainder) = decodeUtf8WithRemainder(combined)
+            pendingUtf8 = remainder
+            if (decoded.isEmpty()) return
+            appendAnsiText(decoded, isStdErr)
+            scrollToBottom()
+        }
+
+        fun appendFooter(text: String) { footer.text = text; scrollToBottom() }
+
+        private fun scrollToBottom() {
+            SwingUtilities.invokeLater {
+                val max = scroll.verticalScrollBar.maximum
+                scroll.verticalScrollBar.value = max
+            }
+        }
+
+        private fun decodeUtf8WithRemainder(bytes: ByteArray): Pair<String, ByteArray> {
+            if (bytes.isEmpty()) return "" to ByteArray(0)
+            // Fast path: try decode all
+            try {
+                return String(bytes, Charsets.UTF_8) to ByteArray(0)
+            } catch (_: Throwable) {
+                // fallthrough
+            }
+            // Try leaving 1..3 bytes as remainder until it decodes
+            for (r in 1..3) {
+                if (bytes.size <= r) break
+                val head = bytes.copyOf(bytes.size - r)
+                val tail = bytes.copyOfRange(bytes.size - r, bytes.size)
+                try {
+                    val s = String(head, Charsets.UTF_8)
+                    return s to tail
+                } catch (_: Throwable) {
+                }
+            }
+            // Give up: decode with replacement
+            return String(bytes, Charsets.UTF_8) to ByteArray(0)
+        }
+
+        private fun appendAnsiText(ch: String, isStdErr: Boolean) {
+            var textIn = if (pendingAnsi.isNotEmpty()) {
+                val s = pendingAnsi + ch
+                pendingAnsi = ""
+                s
+            } else ch
+
+            // If a chunk ends mid-escape, buffer it. AnsiEscapeDecoder handles complete sequences only.
+            // Heuristic: if trailing ESC or ESC[ without 'm', stash it and return
+            val escIdx = textIn.lastIndexOf('\u001B')
+            if (escIdx >= 0 && escIdx >= textIn.length - 4) { // small trailing sequence; be conservative
+                pendingAnsi = textIn.substring(escIdx)
+                textIn = textIn.substring(0, escIdx)
+            }
+
+            if (textIn.isEmpty()) return
+            val base = if (isStdErr) ProcessOutputType.STDERR else ProcessOutputType.STDOUT
+            ansi.escapeText(textIn, base) { chunk, key ->
+                val type = ConsoleViewContentType.getConsoleViewType(key)
+                val attr = type.attributes
+                val set = javax.swing.text.SimpleAttributeSet()
+                attr?.foregroundColor?.let { javax.swing.text.StyleConstants.setForeground(set, it) }
+                attr?.backgroundColor?.let { javax.swing.text.StyleConstants.setBackground(set, it) }
+                val ft = attr?.fontType ?: Font.PLAIN
+                javax.swing.text.StyleConstants.setBold(set, (ft and Font.BOLD) != 0)
+                javax.swing.text.StyleConstants.setItalic(set, (ft and Font.ITALIC) != 0)
+                doc.insertString(doc.length, chunk, set)
+                text.caretPosition = doc.length
+            }
         }
     }
 }

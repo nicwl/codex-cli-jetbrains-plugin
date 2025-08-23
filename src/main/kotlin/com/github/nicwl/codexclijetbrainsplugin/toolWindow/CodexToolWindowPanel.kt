@@ -10,15 +10,27 @@ import com.intellij.openapi.actionSystem.*
 import com.intellij.openapi.options.ShowSettingsUtil
 import com.intellij.openapi.util.SystemInfo
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBScrollPane
-import com.intellij.ui.components.JBTextArea
+import com.intellij.ui.EditorTextField
 import com.intellij.util.ui.JBUI
+import com.github.nicwl.codexclijetbrainsplugin.shared.CodexKeys
 import java.awt.BorderLayout
 import java.awt.Dimension
 import java.awt.event.InputEvent
 import java.awt.event.KeyEvent
+import com.intellij.codeInsight.lookup.LookupManager
+import com.intellij.codeInsight.lookup.LookupElementBuilder
+import com.intellij.codeInsight.completion.CodeCompletionHandlerBase
+import com.intellij.codeInsight.completion.CompletionType
+import com.intellij.openapi.editor.Editor
+import com.intellij.openapi.editor.EditorFactory
+import com.intellij.openapi.editor.ex.EditorEx
+import com.intellij.openapi.editor.EditorModificationUtil
+// keep single ApplicationManager import above
+import com.intellij.openapi.application.ModalityState
 import javax.swing.AbstractAction
 import javax.swing.JButton
 import javax.swing.JPanel
@@ -26,11 +38,18 @@ import javax.swing.JScrollPane
 import javax.swing.JToolBar
 import javax.swing.JLabel
 import javax.swing.BoxLayout
+import java.awt.event.KeyAdapter
+import javax.swing.KeyStroke
+import com.intellij.openapi.editor.event.DocumentEvent
+import com.intellij.openapi.editor.event.DocumentListener
+import javax.swing.text.BadLocationException
+import javax.swing.SwingUtilities
 
 class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
+    private val log = Logger.getInstance(CodexToolWindowPanel::class.java)
     private val session = project.getService(CodexSessionService::class.java)
-    private val chat = ChatView()
-    private val input = JBTextArea(3, 80)
+    private val chat = ChatView(project)
+    private val input = EditorTextField("", project, CodexChatFileType)
     private val statusLabel = JLabel("Tokens: total=0 input=0 (+ 0 cached) output=0 (reasoning 0)")
     private val tokenAgg = TokenAggregator()
     private var assistantStreaming = false
@@ -38,6 +57,20 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
     private val rootPanel = JPanel(BorderLayout()).apply {
         border = JBUI.Borders.empty(4)
     }
+    // no manual lookup state; rely on IDE completion
+
+    private data class SlashCommand(val id: String, val title: String, val description: String, val needsArg: Boolean = false)
+    private var slashLookupRequested = false
+    private val slashCommands = listOf(
+        SlashCommand("compact", "Compact context", "Summarize and compress context for the next turns"),
+        SlashCommand("status", "Show status", "Show Codex session status and model info"),
+        SlashCommand("diff", "Show git diff", "Display current workspace git diff with colors"),
+        SlashCommand("mcp", "List MCP tools", "List configured MCP servers and tools"),
+        SlashCommand("new", "New session", "Start a fresh Codex session"),
+        SlashCommand("model", "Switch model", "Override the model for next turns", needsArg = true),
+        SlashCommand("approvals", "Set approval mode", "Change approvals: untrusted | on_request | on_failure | never", needsArg = true),
+        SlashCommand("quit", "Quit", "Close the Codex tool window")
+    )
 
     val component = rootPanel
 
@@ -48,20 +81,17 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
         rootPanel.add(toolbar, BorderLayout.NORTH)
         rootPanel.add(chat, BorderLayout.CENTER)
 
-        // Enable soft wraps for console output to avoid horizontal scrolling
-        // chat view uses wrapping by default
-
-        input.lineWrap = true
-        input.wrapStyleWord = true
+        // Configure chat input (EditorTextField) with soft wraps and keybindings
+        input.addSettingsProvider { ed ->
+            (ed as? EditorEx)?.settings?.isUseSoftWraps = true
+            ed.putUserData(CodexKeys.CHAT_INPUT, true)
+        }
+        installSlashCompletion()
         val inputPanel = JPanel(BorderLayout()).apply { border = JBUI.Borders.emptyTop(6) }
         val sendButton = JButton("Send").apply {
             addActionListener { sendCurrentInput() }
         }
-        inputPanel.add(
-            JBScrollPane(
-                input, JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED, JScrollPane.HORIZONTAL_SCROLLBAR_NEVER
-            ), BorderLayout.CENTER
-        )
+        inputPanel.add(input, BorderLayout.CENTER)
         inputPanel.add(sendButton, BorderLayout.EAST)
         // Stack input above a simple status bar
         val southStack = JPanel().apply { layout = BoxLayout(this, BoxLayout.Y_AXIS) }
@@ -74,18 +104,9 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
         rootPanel.add(southStack, BorderLayout.SOUTH)
 
         // Key bindings: Enter to send, Shift+Enter to insert newline
-        val insertBreak = input.actionMap.get("insert-break")
-        input.inputMap.put(javax.swing.KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), "send-message")
-        input.actionMap.put("send-message", object : AbstractAction() {
-            override fun actionPerformed(e: java.awt.event.ActionEvent?) {
-                sendCurrentInput()
-            }
-        })
-        input.inputMap.put(
-            javax.swing.KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, InputEvent.SHIFT_DOWN_MASK), "insert-break"
-        )
-        if (insertBreak != null) {
-            input.actionMap.put("insert-break", insertBreak)
+        // Add Enter/Shift+Enter bindings to the editor component once it's created
+        SwingUtilities.invokeLater {
+            input.editor?.let { installEditorKeyBindings(it) }
         }
 
         // Interrupt keybindings
@@ -136,6 +157,91 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
         session.startIfNeeded()
     }
 
+    private fun installSlashCompletion() {
+        // Show a Lookup with our slash commands when text is a single token starting with '/'
+        input.addDocumentListener(object : DocumentListener {
+            override fun documentChanged(event: DocumentEvent) {
+                val ed = input.editor ?: return
+                val txt = ed.document.text
+                val singleTokenSlash = txt.startsWith('/') && txt.indexOfFirst { it.isWhitespace() } < 0
+                log.warn("[slash] docChanged text='${txt.replace("\n", "\\n")}' singleToken=$singleTokenSlash")
+                val active = LookupManager.getActiveLookup(ed)
+                if (singleTokenSlash) {
+                    val prefix = txt.drop(1).lowercase()
+                    val items = if (prefix.isEmpty()) slashCommands else slashCommands.filter { it.id.startsWith(prefix) }
+                    if (items.isEmpty()) {
+                        if (active != null) LookupManager.getInstance(project).hideActiveLookup()
+                        slashLookupRequested = false
+                        return
+                    }
+                    if (!slashLookupRequested) {
+                        slashLookupRequested = true
+                        log.warn("[slash] scheduling lookup open after write; prefix='$prefix' items=${items.size}")
+                        ApplicationManager.getApplication().invokeLater({
+                            try {
+                                val stillEd = input.editor ?: return@invokeLater
+                                val current = stillEd.document.text
+                                val stillSingle = current.startsWith('/') && current.indexOfFirst { it.isWhitespace() } < 0
+                                val pfx = current.drop(1).lowercase()
+                                val list = if (pfx.isEmpty()) slashCommands else slashCommands.filter { it.id.startsWith(pfx) }
+                                val hasActive = LookupManager.getActiveLookup(stillEd) != null
+                                log.warn("[slash] invokeLater: stillSingle=$stillSingle hasActive=$hasActive filtered=${list.size}")
+                                if (stillSingle && list.isNotEmpty()) {
+                                    // Close any stale lookup then open a filtered one
+                                    if (hasActive) LookupManager.getInstance(project).hideActiveLookup()
+                                    showSlashLookup(stillEd, list)
+                                }
+                            } finally {
+                                slashLookupRequested = false
+                            }
+                        }, ModalityState.current())
+                    }
+                } else {
+                    if (active != null) {
+                        log.warn("[slash] hiding active lookup (not single token)")
+                        LookupManager.getInstance(project).hideActiveLookup()
+                    }
+                    slashLookupRequested = false
+                }
+            }
+        })
+    }
+
+    private fun showSlashLookup(editor: Editor, items: List<SlashCommand>) {
+        val elements = items.map { sc ->
+            val insert = "/${sc.id}" + if (sc.needsArg) " " else ""
+            // Use id as lookup string so typing filters by id; keep '/' only in presentation
+            LookupElementBuilder
+                .create(sc.id)
+                .withPresentableText("/${sc.id}")
+                .withTailText("  —  ${sc.title}", true)
+                .withTypeText(sc.description, true)
+                .withInsertHandler { ctx, _ ->
+                    // Default insertion replaces the prefix (e.g., 'sta' -> 'status'); prepend '/' if missing and add space for args
+                    val ed = ctx.editor
+                    val doc = ctx.document
+                    val caret = ed.caretModel.offset
+                    val text = doc.text
+                    val hasSlash = text.startsWith('/')
+                    // Ensure a leading slash exists
+                    if (!hasSlash) {
+                        doc.insertString(0, "/")
+                        ed.caretModel.moveToOffset(caret + 1)
+                    }
+                    // Add trailing space if needed
+                    if (sc.needsArg) {
+                        val pos = ed.caretModel.offset
+                        val needsSpace = pos == doc.textLength || doc.charsSequence.getOrNull(pos) != ' '
+                        if (needsSpace) {
+                            doc.insertString(pos, " ")
+                            ed.caretModel.moveToOffset(pos + 1)
+                        }
+                    }
+                }
+        }.toTypedArray()
+        LookupManager.getInstance(project).showLookup(editor, *elements)
+    }
+
     private fun sendCurrentInput() {
         val text = input.text.trim()
         if (text.isEmpty()) return
@@ -148,6 +254,23 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
         chat.addUserMessage(text)
         session.sendUserText(text)
         input.text = ""
+    }
+
+    private fun installEditorKeyBindings(editor: Editor) {
+        val comp = editor.contentComponent
+        // Enter: send message
+        comp.inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), "codex-send")
+        comp.actionMap.put("codex-send", object : AbstractAction() {
+            override fun actionPerformed(e: java.awt.event.ActionEvent?) {
+                if (LookupManager.getActiveLookup(editor) != null) return
+                sendCurrentInput()
+            }
+        })
+        // Shift+Enter: insert newline
+        comp.inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, InputEvent.SHIFT_DOWN_MASK), "codex-insert-break")
+        comp.actionMap.put("codex-insert-break", object : AbstractAction() {
+            override fun actionPerformed(e: java.awt.event.ActionEvent?) { EditorModificationUtil.insertStringAtCaret(editor, "\n") }
+        })
     }
 
     private fun handleSlashCommand(raw: String): Boolean {
@@ -341,6 +464,26 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
     override fun onReasoningEnd() { chat.endReasoning() }
 
     override fun onMcpToolsListed(tools: Map<String, String>) { chat.addMcpTools(tools) }
+
+    // Exec streaming console bubble
+    override fun onExecCommandBegin(callId: String, commandDisplay: String) {
+        chat.beginExecConsole(callId, commandDisplay)
+    }
+
+    override fun onExecCommandOutputDelta(callId: String, isStdErr: Boolean, bytes: ByteArray) {
+        chat.appendExecConsoleDelta(callId, isStdErr, bytes)
+    }
+
+    override fun onExecCommandEnd(
+        callId: String,
+        exitCode: Int,
+        durationSecs: Long,
+        durationNanos: Int,
+        stdout: String,
+        stderr: String,
+    ) {
+        chat.endExecConsole(callId, exitCode, durationSecs, durationNanos)
+    }
 
     // Status bar updater
     private fun updateTokenStatus() {
