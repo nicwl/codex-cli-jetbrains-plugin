@@ -5,4 +5,4 @@
 .kotlin
 .qodana
 build
-codex
+.gradle-home

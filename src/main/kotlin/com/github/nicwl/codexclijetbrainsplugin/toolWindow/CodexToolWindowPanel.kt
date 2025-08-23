@@ -4,8 +4,7 @@ import com.github.nicwl.codexclijetbrainsplugin.codex.CodexEventListener
 import com.github.nicwl.codexclijetbrainsplugin.codex.CodexSessionService
 import com.github.nicwl.codexclijetbrainsplugin.settings.CodexSettingsConfigurable
 import com.github.nicwl.codexclijetbrainsplugin.codex.CodexSettingsState
-import com.intellij.execution.impl.ConsoleViewImpl
-import com.intellij.execution.ui.ConsoleView
+// Console imports removed in favor of ChatView
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.actionSystem.*
 import com.intellij.openapi.options.ShowSettingsUtil
@@ -25,13 +24,17 @@ import javax.swing.JButton
 import javax.swing.JPanel
 import javax.swing.JScrollPane
 import javax.swing.JToolBar
+import javax.swing.JLabel
+import javax.swing.BoxLayout
 
 class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
     private val session = project.getService(CodexSessionService::class.java)
-    private val console: ConsoleView = ConsoleViewImpl(project, true).also {
-        com.intellij.openapi.util.Disposer.register(project, it)
-    }
+    private val chat = ChatView()
     private val input = JBTextArea(3, 80)
+    private val statusLabel = JLabel("Tokens: total=0 input=0 (+ 0 cached) output=0 (reasoning 0)")
+    private val tokenAgg = TokenAggregator()
+    private var assistantStreaming = false
+    private var lastAssistantFinal: String? = null
     private val rootPanel = JPanel(BorderLayout()).apply {
         border = JBUI.Borders.empty(4)
     }
@@ -43,17 +46,14 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
 
         val toolbar = createToolbar()
         rootPanel.add(toolbar, BorderLayout.NORTH)
-        rootPanel.add(console.component, BorderLayout.CENTER)
+        rootPanel.add(chat, BorderLayout.CENTER)
 
         // Enable soft wraps for console output to avoid horizontal scrolling
-        val editor = (console as ConsoleViewImpl).editor
-        editor?.settings?.isUseSoftWraps = true
+        // chat view uses wrapping by default
 
         input.lineWrap = true
         input.wrapStyleWord = true
-        val inputPanel = JPanel(BorderLayout()).apply {
-            border = JBUI.Borders.emptyTop(6)
-        }
+        val inputPanel = JPanel(BorderLayout()).apply { border = JBUI.Borders.emptyTop(6) }
         val sendButton = JButton("Send").apply {
             addActionListener { sendCurrentInput() }
         }
@@ -63,7 +63,15 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
             ), BorderLayout.CENTER
         )
         inputPanel.add(sendButton, BorderLayout.EAST)
-        rootPanel.add(inputPanel, BorderLayout.SOUTH)
+        // Stack input above a simple status bar
+        val southStack = JPanel().apply { layout = BoxLayout(this, BoxLayout.Y_AXIS) }
+        val statusPanel = JPanel(BorderLayout()).apply {
+            border = JBUI.Borders.empty(4, 0, 0, 0)
+            add(statusLabel, BorderLayout.WEST)
+        }
+        southStack.add(inputPanel)
+        southStack.add(statusPanel)
+        rootPanel.add(southStack, BorderLayout.SOUTH)
 
         // Key bindings: Enter to send, Shift+Enter to insert newline
         val insertBreak = input.actionMap.get("insert-break")
@@ -105,10 +113,8 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
             inputIm.put(ksCancel, "codex-interrupt")
         }
 
-        console.print(
-            "Codex: ready. Click Start or type and Send.\n",
-            com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT
-        )
+        chat.addNote("Codex: ready. Click Start or type and Send.")
+        updateTokenStatus()
     }
 
     private fun createToolbar(): JToolBar {
@@ -141,7 +147,7 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
                 return
             }
         }
-        console.print("You: $text\n", com.intellij.execution.ui.ConsoleViewContentType.USER_INPUT)
+        chat.addUserMessage(text)
         session.sendUserText(text)
         input.text = ""
     }
@@ -152,57 +158,44 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
         val args = parts.drop(1)
         when (cmd) {
             "compact" -> {
-                console.print(
-                    "[note] compacting context...\n", com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT
-                )
+                chat.addNote("Compacting context…")
                 session.sendCompact()
                 return true
             }
 
             "status" -> {
-                console.print(
-                    session.getStatusRich(project.basePath) + "\n",
-                    com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT
-                )
+                chat.addStatusBlock(session.getStatusRich(project.basePath))
                 return true
             }
 
             "diff" -> {
-                console.print(
-                    "[note] computing git diff...\n", com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT
-                )
+                chat.addNote("Computing git diff…")
                 computeGitDiff()
                 return true
             }
 
             "mcp" -> {
-                console.print(
-                    "[note] listing MCP tools...\n", com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT
-                )
+                chat.addNote("Listing MCP tools…")
                 session.sendListMcpTools()
                 return true
             }
 
             "new" -> {
-                console.print(
-                    "[note] starting new Codex session...\n",
-                    com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT
-                )
+                chat.addNote("Starting new Codex session…")
                 session.restart()
+                tokenAgg.reset()
+                updateTokenStatus()
+                assistantStreaming = false
+                lastAssistantFinal = null
                 return true
             }
 
             "model" -> {
                 val slug = args.firstOrNull()
                 if (slug.isNullOrBlank()) {
-                    console.print(
-                        "Usage: /model <slug>\n", com.intellij.execution.ui.ConsoleViewContentType.LOG_WARNING_OUTPUT
-                    )
+                    chat.addNote("Usage: /model <slug>")
                 } else {
-                    console.print(
-                        "[note] switching model to '$slug'...\n",
-                        com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT
-                    )
+                    chat.addNote("Switching model to ‘$slug’…")
                     session.sendOverrideModel(slug)
                 }
                 return true
@@ -217,34 +210,13 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
                     "never" -> "never"
                     else -> null
                 }
-                if (mapped == null) {
-                    console.print(
-                        "Usage: /approvals <untrusted|on_request|on_failure|never>\n",
-                        com.intellij.execution.ui.ConsoleViewContentType.LOG_WARNING_OUTPUT
-                    )
-                } else {
-                    console.print(
-                        "[note] setting approval policy to '$mapped'...\n",
-                        com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT
-                    )
-                    session.sendOverrideApproval(mapped)
-                }
-                return true
-            }
-
-            "logout" -> {
-                console.print(
-                    "[note] logging out...\n", com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT
-                )
-                runExternalCommand(listOf(CodexSettingsState.getInstance().state.codexPath, "logout"))
+                if (mapped == null) chat.addNote("Usage: /approvals <untrusted|on_request|on_failure|never>")
+                else { chat.addNote("Setting approval policy to ‘$mapped’…"); session.sendOverrideApproval(mapped) }
                 return true
             }
 
             "quit" -> {
-                console.print(
-                    "[note] Close the Codex tool window to quit.\n",
-                    com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT
-                )
+                chat.addNote("Close the Codex tool window to quit.")
                 return true
             }
 
@@ -258,10 +230,7 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
             try {
                 val insideRepo = runCmd(listOf("git", "rev-parse", "--is-inside-work-tree"), baseDir).first
                 if (!insideRepo) {
-                    console.print(
-                        "`/diff` — not inside a git repository\n",
-                        com.intellij.execution.ui.ConsoleViewContentType.LOG_WARNING_OUTPUT
-                    )
+                    chat.addNote("`/diff` — not inside a git repository")
                     return@executeOnPooledThread
                 }
                 val tracked = runCmdCapture(listOf("git", "diff", "--color"), baseDir)
@@ -273,44 +242,9 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
                     untrackedDiff.append(d)
                 }
                 val out = tracked + untrackedDiff.toString()
-                if (out.isBlank()) {
-                    console.print(
-                        "[diff] (no changes)\n", com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT
-                    )
-                } else {
-                    console.print(
-                        "[diff]\n" + out + "\n", com.intellij.execution.ui.ConsoleViewContentType.NORMAL_OUTPUT
-                    )
-                }
+                if (out.isBlank()) chat.addNote("[diff] (no changes)") else chat.addDiff(out)
             } catch (t: Throwable) {
-                console.print(
-                    "Failed to compute diff: ${t.message}\n",
-                    com.intellij.execution.ui.ConsoleViewContentType.ERROR_OUTPUT
-                )
-            }
-        }
-    }
-
-    private fun runExternalCommand(cmd: List<String>) {
-        val baseDir = project.basePath
-        ApplicationManager.getApplication().executeOnPooledThread {
-            try {
-                val pb = ProcessBuilder(cmd)
-                if (baseDir != null) pb.directory(java.io.File(baseDir))
-                pb.redirectErrorStream(true)
-                val p = pb.start()
-                val text = p.inputStream.bufferedReader().readText()
-                p.waitFor()
-                if (text.isNotBlank()) {
-                    console.print(
-                        text + (if (text.endsWith("\n")) "" else "\n"),
-                        com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT
-                    )
-                }
-            } catch (t: Throwable) {
-                console.print(
-                    "Command failed: ${t.message}\n", com.intellij.execution.ui.ConsoleViewContentType.ERROR_OUTPUT
-                )
+                chat.addError("Failed to compute diff: ${t.message}")
             }
         }
     }
@@ -337,24 +271,34 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
 
     // CodexEventListener implementation
     override fun onConnected(model: String) {
-        console.print("Connected to model: $model\n", com.intellij.execution.ui.ConsoleViewContentType.SYSTEM_OUTPUT)
+        chat.addNote("Connected to model: $model")
+        tokenAgg.reset()
+        updateTokenStatus()
+        assistantStreaming = false
+        lastAssistantFinal = null
     }
 
     override fun onAgentMessage(text: String) {
-        console.print("$text\n", com.intellij.execution.ui.ConsoleViewContentType.NORMAL_OUTPUT)
+        if (text == lastAssistantFinal) {
+            assistantStreaming = false
+            return
+        }
+        chat.finalizeAssistantMessage(text)
+        lastAssistantFinal = text
+        assistantStreaming = false
     }
 
     override fun onAgentMessageDelta(delta: String) {
-        console.print(delta, com.intellij.execution.ui.ConsoleViewContentType.NORMAL_OUTPUT)
+        assistantStreaming = true
+        lastAssistantFinal = null
+        chat.appendAssistantDelta(delta)
     }
 
-    override fun onBackground(message: String) {
-        console.print("[note] $message\n", com.intellij.execution.ui.ConsoleViewContentType.LOG_WARNING_OUTPUT)
-    }
+    override fun onBackground(message: String) { chat.addNote(message) }
 
     override fun onTokenUsage(summary: String) {
-        // Could add to status bar; for now, log
-        console.print("$summary\n", com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT)
+        tokenAgg.ingestSummary(summary)
+        updateTokenStatus()
     }
 
     override fun onExecApprovalRequest(submissionId: String, command: List<String>, cwd: String, reason: String?) {
@@ -388,49 +332,68 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
         }
     }
 
-    override fun onTurnDiff(unifiedDiff: String) {
-        console.print("[diff]\n$unifiedDiff\n", com.intellij.execution.ui.ConsoleViewContentType.LOG_DEBUG_OUTPUT)
-    }
+    override fun onTurnDiff(unifiedDiff: String) { chat.addDiff(unifiedDiff) }
 
-    override fun onError(message: String) {
-        console.print("[error] $message\n", com.intellij.execution.ui.ConsoleViewContentType.ERROR_OUTPUT)
-    }
+    override fun onError(message: String) { chat.addError(message) }
 
     // Reasoning stream
-    private var reasoningOpen = false
-    override fun onReasoningStart() {
-        if (!reasoningOpen) {
-            console.print("\n— reasoning —\n", com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT)
-            reasoningOpen = true
-        }
+    override fun onReasoningStart() { chat.beginReasoning() }
+    override fun onReasoningDelta(delta: String) { chat.appendReasoning(delta) }
+    override fun onReasoningSectionBreak() { chat.reasoningSectionBreak() }
+    override fun onReasoningEnd() { chat.endReasoning() }
+
+    override fun onMcpToolsListed(tools: Map<String, String>) { chat.addMcpTools(tools) }
+
+    // Status bar updater
+    private fun updateTokenStatus() {
+        statusLabel.text = tokenAgg.formatted()
+    }
+}
+
+// Aggregates token usage across turns; robust to streaming updates by computing deltas.
+private class TokenAggregator {
+    private var totalInput = 0
+    private var totalCached = 0
+    private var totalOutput = 0
+    private var totalReasoning = 0
+
+    private var lastInput = 0
+    private var lastCached = 0
+    private var lastOutput = 0
+    private var lastReasoning = 0
+
+    fun reset() {
+        totalInput = 0; totalCached = 0; totalOutput = 0; totalReasoning = 0
+        lastInput = 0; lastCached = 0; lastOutput = 0; lastReasoning = 0
     }
 
-    override fun onReasoningDelta(delta: String) {
-        console.print(delta, com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT)
+    fun ingestSummary(summary: String) {
+        val input = Regex("input=\\s*(\\d+)").find(summary)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+        val cached = Regex("\\(\\+\\s*(\\d+)\\s*cached\\)").find(summary)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+        val output = Regex("output=\\s*(\\d+)").find(summary)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+        val reasoning = Regex("reasoning\\s*(\\d+)").find(summary)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+
+        val reset = input < lastInput || cached < lastCached || output < lastOutput || reasoning < lastReasoning
+        if (reset) { lastInput = 0; lastCached = 0; lastOutput = 0; lastReasoning = 0 }
+
+        val dInput = (input - lastInput).coerceAtLeast(0)
+        val dCached = (cached - lastCached).coerceAtLeast(0)
+        val dOutput = (output - lastOutput).coerceAtLeast(0)
+        val dReasoning = (reasoning - lastReasoning).coerceAtLeast(0)
+
+        totalInput += dInput
+        totalCached += dCached
+        totalOutput += dOutput
+        totalReasoning += dReasoning
+
+        lastInput = input
+        lastCached = cached
+        lastOutput = output
+        lastReasoning = reasoning
     }
 
-    override fun onReasoningSectionBreak() {
-        console.print("\n— reasoning section —\n", com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT)
-    }
-
-    override fun onReasoningEnd() {
-        if (reasoningOpen) {
-            console.print("\n", com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT)
-            reasoningOpen = false
-        }
-    }
-
-    override fun onMcpToolsListed(tools: Map<String, String>) {
-        if (tools.isEmpty()) {
-            console.print(
-                "[mcp] No tools configured.\n", com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT
-            )
-        } else {
-            console.print("[mcp] Tools:\n", com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT)
-            tools.forEach { (name, desc) ->
-                val line = if (desc.isNotBlank()) " - $name: $desc\n" else " - $name\n"
-                console.print(line, com.intellij.execution.ui.ConsoleViewContentType.LOG_INFO_OUTPUT)
-            }
-        }
+    fun formatted(): String {
+        val total = totalInput + totalCached + totalOutput
+        return "Tokens: total=$total input=$totalInput (+ $totalCached cached) output=$totalOutput (reasoning $totalReasoning)"
     }
 }
