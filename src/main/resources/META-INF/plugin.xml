@@ -11,5 +11,6 @@
     <extensions defaultExtensionNs="com.intellij">
         <toolWindow factoryClass="com.github.nicwl.codexclijetbrainsplugin.toolWindow.CodexToolWindowFactory" id="Codex" anchor="right"/>
         <applicationConfigurable instance="com.github.nicwl.codexclijetbrainsplugin.settings.CodexSettingsConfigurable" id="com.github.nicwl.codex.settings" displayName="Codex CLI"/>
+        <notificationGroup id="Codex Notifications" displayType="BALLOON" isLogByDefault="true"/>
     </extensions>
 </idea-plugin>

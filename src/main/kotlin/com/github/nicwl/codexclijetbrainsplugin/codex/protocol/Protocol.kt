@@ -1,6 +1,6 @@
 package com.github.nicwl.codexclijetbrainsplugin.codex.protocol
 
-import com.github.nicwl.codexclijetbrainsplugin.codex.protocol.json.ExternalTagToInternalTypeSerializer
+import com.github.nicwl.codexclijetbrainsplugin.codex.protocol.json.ExternalTagging
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
@@ -17,6 +17,9 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.MapSerializer
+import kotlinx.serialization.builtins.serializer
 
 @Serializable
 data class Event(
@@ -102,7 +105,7 @@ sealed class EventMsg {
     @Serializable
     data class McpInvocation(val server: String, val tool: String, val arguments: JsonElement? = null)
 
-    @Serializable(with = McpToolCallResultExtSerializer::class)
+    @Serializable(with = McpToolCallResultSerializer::class)
     sealed class McpToolCallResult {
         @Serializable
         @SerialName("Ok")
@@ -120,6 +123,7 @@ sealed class EventMsg {
         @SerialName("call_id") val callId: String,
         val command: List<String>,
         val cwd: String,
+        @Serializable(with = ParsedCommandListExternalSerializer::class)
         @SerialName("parsed_cmd") val parsedCmd: List<ParsedCommand> = emptyList(),
     ) : EventMsg()
 
@@ -163,6 +167,7 @@ sealed class EventMsg {
     @SerialName("apply_patch_approval_request")
     data class ApplyPatchApprovalRequest(
         @SerialName("call_id") val callId: String,
+        @Serializable(with = FileChangeMapExternalSerializer::class)
         val changes: Map<String, FileChange>,
         val reason: String? = null,
         @SerialName("grant_root") val grantRoot: String? = null,
@@ -174,6 +179,7 @@ sealed class EventMsg {
     data class PatchApplyBegin(
         @SerialName("call_id") val callId: String,
         @SerialName("auto_approved") val autoApproved: Boolean,
+        @Serializable(with = FileChangeMapExternalSerializer::class)
         val changes: Map<String, FileChange>,
     ) : EventMsg()
 
@@ -242,7 +248,8 @@ sealed class EventMsg {
     @Serializable
     data class HistoryEntry(@SerialName("session_id") val sessionId: String, val ts: Long, val text: String)
 
-    @Serializable(with = FileChangeExtSerializer::class)
+    @Serializable
+    @JsonClassDiscriminator("type")
     sealed class FileChange {
         @Serializable
         @SerialName("add")
@@ -261,7 +268,8 @@ sealed class EventMsg {
     }
 
     // Parsed command structures (heuristics for classifying shell commands)
-    @Serializable(with = ParsedCommandExtSerializer::class)
+    @Serializable
+    @JsonClassDiscriminator("type")
     sealed class ParsedCommand {
         @Serializable @SerialName("Read")
         data class Read(val cmd: String, val name: String) : ParsedCommand()
@@ -321,11 +329,9 @@ data class CallToolResult(
 
 // ───────── Custom serializers for external-tagged enums from Rust ─────────
 
-// Generic external-tag -> internal type transformers for sealed enums
-
-object ParsedCommandExtSerializer : ExternalTagToInternalTypeSerializer<EventMsg.ParsedCommand>(EventMsg.ParsedCommand.serializer()) {
-    override fun normalizeTagForDecode(tag: String): String = tag.trim()
-}
+// Legacy explicit serializers avoid init-order cycles when the sealed class references its own serializer
+object ParsedCommandExternalSerializer : KSerializer<EventMsg.ParsedCommand> by ExternalTagging.forType(EventMsg.ParsedCommand::class)
+object ParsedCommandListExternalSerializer : KSerializer<List<EventMsg.ParsedCommand>> by ListSerializer(ParsedCommandExternalSerializer)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Outgoing submissions (SQ) – mirrors Rust Submission/Op shapes
@@ -428,12 +434,30 @@ sealed class SandboxPolicy {
     ) : SandboxPolicy()
 }
 
-object FileChangeExtSerializer : ExternalTagToInternalTypeSerializer<EventMsg.FileChange>(EventMsg.FileChange.serializer()) {
-    override fun normalizeTagForDecode(tag: String): String = tag.lowercase()
-}
+object FileChangeExternalSerializer : KSerializer<EventMsg.FileChange> by ExternalTagging.forType(EventMsg.FileChange::class)
+object FileChangeMapExternalSerializer : KSerializer<Map<String, EventMsg.FileChange>> by MapSerializer(String.serializer(), FileChangeExternalSerializer)
 
-object McpToolCallResultExtSerializer : ExternalTagToInternalTypeSerializer<EventMsg.McpToolCallResult>(EventMsg.McpToolCallResult.serializer()) {
-    override fun normalizeTagForDecode(tag: String): String = tag
-    override fun primitiveFieldFor(tag: String): String = if (tag == "Err") "error" else "value"
-    override fun objectFieldFor(tag: String): String? = if (tag == "Ok") "value" else null
+object McpToolCallResultSerializer : KSerializer<EventMsg.McpToolCallResult> {
+    override val descriptor = kotlinx.serialization.descriptors.buildClassSerialDescriptor("McpToolCallResult")
+
+    override fun deserialize(decoder: Decoder): EventMsg.McpToolCallResult {
+        val input = decoder as JsonDecoder
+        val obj = input.decodeJsonElement().jsonObject
+        require(obj.size == 1) { "McpToolCallResult expects single-key object, got ${obj.keys}" }
+        val (tag, payload) = obj.entries.first()
+        return when (tag) {
+            "Ok" -> EventMsg.McpToolCallResult.Ok(value = input.json.decodeFromJsonElement(CallToolResult.serializer(), payload))
+            "Err" -> EventMsg.McpToolCallResult.Err(error = payload.jsonPrimitive.content)
+            else -> EventMsg.McpToolCallResult.Err(error = payload.toString())
+        }
+    }
+
+    override fun serialize(encoder: Encoder, value: EventMsg.McpToolCallResult) {
+        val output = encoder as JsonEncoder
+        val json = when (value) {
+            is EventMsg.McpToolCallResult.Ok -> JsonObject(mapOf("Ok" to output.json.encodeToJsonElement(CallToolResult.serializer(), value.value)))
+            is EventMsg.McpToolCallResult.Err -> JsonObject(mapOf("Err" to JsonPrimitive(value.error)))
+        }
+        output.encodeJsonElement(json)
+    }
 }

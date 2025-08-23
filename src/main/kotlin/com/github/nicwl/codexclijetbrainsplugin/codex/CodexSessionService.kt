@@ -2,24 +2,16 @@ package com.github.nicwl.codexclijetbrainsplugin.codex
 
 import com.github.nicwl.codexclijetbrainsplugin.codex.protocol.Event
 import com.github.nicwl.codexclijetbrainsplugin.codex.protocol.EventMsg
-import com.google.gson.Gson
+import com.github.nicwl.codexclijetbrainsplugin.codex.protocol.Op
+import com.github.nicwl.codexclijetbrainsplugin.codex.protocol.Submission
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import kotlinx.serialization.json.Json
-import com.intellij.execution.configurations.GeneralCommandLine
-import com.intellij.execution.process.KillableColoredProcessHandler
-import com.intellij.execution.process.ProcessEvent
-import com.intellij.execution.process.ProcessListener
-import com.intellij.execution.process.ProcessOutputType
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
-import com.intellij.openapi.util.Key
-import kotlinx.serialization.SerializationException
-import java.io.BufferedWriter
-import java.io.OutputStreamWriter
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
@@ -45,13 +37,11 @@ interface CodexEventListener {
 }
 
 @Service(Service.Level.PROJECT)
-class CodexSessionService(private val project: Project) : Disposable {
+class CodexSessionService(private val project: Project) : Disposable, CodexTransportListener {
     private val log = Logger.getInstance(CodexSessionService::class.java)
     private val listeners = CopyOnWriteArrayList<CodexEventListener>()
-    private val jsonCodec = Json { ignoreUnknownKeys = true; classDiscriminator = "type" }
-
-    @Volatile private var processHandler: KillableColoredProcessHandler? = null
-    @Volatile private var stdin: BufferedWriter? = null
+    private val jsonOut = Json { classDiscriminator = "type"; explicitNulls = false }
+    private val transport = project.getService(CodexProcessService::class.java)
 
     // Tracks the current model from SessionConfigured
     @Volatile private var modelSlug: String? = null
@@ -83,7 +73,7 @@ class CodexSessionService(private val project: Project) : Disposable {
         listeners.remove(listener)
     }
 
-    fun isRunning(): Boolean = processHandler?.isProcessTerminated == false
+    fun isRunning(): Boolean = transport.isRunning()
 
     fun startIfNeeded() {
         if (isRunning()) return
@@ -105,91 +95,57 @@ class CodexSessionService(private val project: Project) : Disposable {
         }
         args += listOf("-c", "approval_policy=\"$approvalCli\"")
         args += listOf("-c", "sandbox_mode=\"${settings.sandboxMode}\"")
-        val cmd = GeneralCommandLine(args)
-            .withCharset(StandardCharsets.UTF_8)
-        project.basePath?.let { cmd.withWorkDirectory(it) }
-        // Use environment similar to user's shell
-        cmd.withParentEnvironmentType(GeneralCommandLine.ParentEnvironmentType.CONSOLE)
-        cmd.environment.remove("OPENAI_API_KEY")
-
-        val handler = try {
-            log.warn("Starting codex process: ${args.joinToString(" ")} (cwd=${cmd.workDirectory?.path ?: ""})")
-            KillableColoredProcessHandler(cmd)
-        } catch (t: Throwable) {
-            listeners.forEach { it.onError("Failed to start codex: ${t.message}") }
-            log.warn("Failed to start codex", t)
-            return
-        }
-        processHandler = handler
-
-        // Connect stdin
-        ApplicationManager.getApplication().executeOnPooledThread {
-            try {
-                stdin = BufferedWriter(OutputStreamWriter(handler.processInput, StandardCharsets.UTF_8))
-            } catch (t: Throwable) {
-                log.warn("Failed to attach stdin", t)
-            }
-        }
-
-        // Buffer and process lines from stdout
-        val stdoutBuffer = StringBuilder()
-        val stderrBuffer = StringBuilder()
-        handler.addProcessListener(object : ProcessListener {
-            override fun startNotified(event: ProcessEvent) {}
-
-            override fun processTerminated(event: ProcessEvent) {
-                log.warn("codex exited with ${event.exitCode}")
-            }
-
-            override fun onTextAvailable(event: ProcessEvent, outputType: Key<*>) {
-                val text = event.text ?: return
-                when (outputType) {
-                    ProcessOutputType.STDOUT -> synchronized(stdoutBuffer) {
-                        stdoutBuffer.append(text)
-                        var idx: Int
-                        while (true) {
-                            idx = stdoutBuffer.indexOf("\n")
-                            if (idx < 0) break
-                            val line = stdoutBuffer.substring(0, idx).trim()
-                            stdoutBuffer.delete(0, idx + 1)
-                            if (line.isNotEmpty()) {
-                                log.warn("[codex stdout line] $line")
-                                handleStdoutLine(line)
-                            }
-                        }
-                    }
-                    ProcessOutputType.STDERR -> synchronized(stderrBuffer) {
-                        stderrBuffer.append(text)
-                        var idx: Int
-                        while (true) {
-                            idx = stderrBuffer.indexOf("\n")
-                            if (idx < 0) break
-                            val line = stderrBuffer.substring(0, idx).trim()
-                            stderrBuffer.delete(0, idx + 1)
-                            if (line.isNotEmpty()) {
-                                log.warn("[codex stderr line] $line")
-                                listeners.forEach { l -> safeSwing { l.onBackground(line) } }
-                            }
-                        }
-                    }
-                    else -> { /* ignore other streams */ }
-                }
-            }
-        })
-
-        handler.startNotify()
+        // Ensure the agent does not spawn external notifications; we surface them via the IDE
+        args += listOf("-c", "notify=[]")
+        // Note: codex proto does not accept a `-c cwd=...` override. It derives cwd
+        // from the process working directory, which we set via CodexProcessService.
+        // Register as transport listener and start the process
+        transport.addListener(this)
+        transport.start(args, project.basePath)
     }
 
-    private fun handleStdoutLine(line: String) {
-        val ev: Event
-        try {
-            ev = jsonCodec.decodeFromString(Event.serializer(), line)
-        } catch (e: SerializationException) {
-            log.warn("Could not deserialize codex event from line: $line", e)
-            return
-        }
+    // Invoked by CodexProcessService
+    override fun onEvent(ev: Event) {
         val id = ev.id
         when (val msg = ev.msg) {
+            is EventMsg.TaskComplete -> {
+                // Notify the user appropriately:
+                // - If IDE is focused and the Codex tool window is visible, do nothing (the UI already shows it)
+                // - If IDE is focused but tool window is hidden, show an in-IDE balloon
+                // - If IDE is not focused, send a system notification
+                try {
+                    val toolVisible = try {
+                        val tw = com.intellij.openapi.wm.ToolWindowManager.getInstance(project).getToolWindow("Codex")
+                        tw?.isVisible == true
+                    } catch (_: Throwable) { false }
+
+                    val isIdeActive = try {
+                        java.awt.KeyboardFocusManager.getCurrentKeyboardFocusManager().activeWindow != null
+                    } catch (_: Throwable) { true }
+
+                    if (isIdeActive && toolVisible) {
+                        return
+                    }
+
+                    val title = "Codex: Task complete"
+                    val content = msg.lastAgentMessage?.trim()?.takeIf { it.isNotEmpty() }?.take(300)
+
+                    // Show a notification when IDE not focused or tool window is hidden.
+                    // The IDE will use system notifications if enabled in settings for this group.
+                    if (!isIdeActive || !toolVisible) {
+                        val group = com.intellij.notification.NotificationGroupManager.getInstance()
+                            .getNotificationGroup("Codex Notifications")
+                        val n = if (content == null) {
+                            group.createNotification(title, com.intellij.notification.NotificationType.INFORMATION)
+                        } else {
+                            group.createNotification(title, content, com.intellij.notification.NotificationType.INFORMATION)
+                        }
+                        n.notify(project)
+                    }
+                } catch (_: Throwable) {
+                    // Best-effort: avoid breaking the event loop due to notifications
+                }
+            }
             is EventMsg.TaskStarted -> {
                 sawTextDelta = false
                 sawReasoningDelta = false
@@ -339,79 +295,68 @@ class CodexSessionService(private val project: Project) : Disposable {
             is EventMsg.Error -> {
                 listeners.forEach { l -> safeSwing { l.onError(msg.message) } }
             }
-            else -> {
-                // Unhandled event types are ignored for now
-            }
+            else -> { /* ignore unhandled */ }
         }
     }
 
+    override fun onStdErr(line: String) {
+        listeners.forEach { l -> safeSwing { l.onBackground(line) } }
+    }
+
     fun sendUserText(text: String) {
-        val items = listOf(JsonObject().apply {
-            addProperty("type", "text")
-            addProperty("text", text)
-        })
-        val op = JsonObject().apply {
-            addProperty("type", "user_input")
-            add("items", Gson().toJsonTree(items))
-        }
+        val op = Op.UserInput(items = listOf(com.github.nicwl.codexclijetbrainsplugin.codex.protocol.InputItem.Text(text)))
         sendSubmission(op)
     }
 
     fun sendInterrupt() {
-        val op = JsonObject().apply { addProperty("type", "interrupt") }
-        sendSubmission(op)
+        sendSubmission(Op.Interrupt)
     }
 
     fun sendExecApproval(approved: String, submissionIdToApprove: String) {
-        val op = JsonObject().apply {
-            addProperty("type", "exec_approval")
-            addProperty("id", submissionIdToApprove)
-            addProperty("decision", approved) // approved|approved_for_session|denied|abort
+        val decision = when (approved) {
+            "approved" -> com.github.nicwl.codexclijetbrainsplugin.codex.protocol.ReviewDecision.Approved
+            "approved_for_session" -> com.github.nicwl.codexclijetbrainsplugin.codex.protocol.ReviewDecision.ApprovedForSession
+            "denied" -> com.github.nicwl.codexclijetbrainsplugin.codex.protocol.ReviewDecision.Denied
+            else -> com.github.nicwl.codexclijetbrainsplugin.codex.protocol.ReviewDecision.Abort
         }
-        sendSubmission(op)
+        sendSubmission(Op.ExecApproval(id = submissionIdToApprove, decision = decision))
     }
 
     fun sendPatchApproval(approved: String, submissionIdToApprove: String) {
-        val op = JsonObject().apply {
-            addProperty("type", "patch_approval")
-            addProperty("id", submissionIdToApprove)
-            addProperty("decision", approved)
+        val decision = when (approved) {
+            "approved" -> com.github.nicwl.codexclijetbrainsplugin.codex.protocol.ReviewDecision.Approved
+            "approved_for_session" -> com.github.nicwl.codexclijetbrainsplugin.codex.protocol.ReviewDecision.ApprovedForSession
+            "denied" -> com.github.nicwl.codexclijetbrainsplugin.codex.protocol.ReviewDecision.Denied
+            else -> com.github.nicwl.codexclijetbrainsplugin.codex.protocol.ReviewDecision.Abort
         }
-        sendSubmission(op)
+        sendSubmission(Op.PatchApproval(id = submissionIdToApprove, decision = decision))
     }
 
     private fun sendOverrideCwd(cwd: String) {
-        val op = JsonObject().apply {
-            addProperty("type", "override_turn_context")
-            addProperty("cwd", cwd)
-        }
-        sendSubmission(op)
+        sendSubmission(Op.OverrideTurnContext(cwd = cwd))
     }
 
     // Slash commands
     fun sendCompact() {
-        val op = JsonObject().apply { addProperty("type", "compact") }
-        sendSubmission(op)
+        sendSubmission(Op.Compact)
     }
 
     fun sendListMcpTools() {
-        val op = JsonObject().apply { addProperty("type", "list_mcp_tools") }
-        sendSubmission(op)
+        sendSubmission(Op.ListMcpTools)
     }
 
     fun sendOverrideModel(model: String) {
-        val op = JsonObject().apply {
-            addProperty("type", "override_turn_context")
-            addProperty("model", model)
-        }
-        sendSubmission(op)
+        sendSubmission(Op.OverrideTurnContext(model = model))
     }
 
     fun sendOverrideApproval(policy: String) {
-        val op = JsonObject().apply {
-            addProperty("type", "override_turn_context")
-            addProperty("approval_policy", policy)
-        }
+        val op = Op.OverrideTurnContext(approvalPolicy = when (policy) {
+            "on_request" -> com.github.nicwl.codexclijetbrainsplugin.codex.protocol.AskForApproval.OnRequest
+            "on-failure", "on_failure" -> com.github.nicwl.codexclijetbrainsplugin.codex.protocol.AskForApproval.OnFailure
+            "untrusted" -> com.github.nicwl.codexclijetbrainsplugin.codex.protocol.AskForApproval.UnlessTrusted
+            "never" -> com.github.nicwl.codexclijetbrainsplugin.codex.protocol.AskForApproval.Never
+            else -> null
+        })
         currentApprovalPolicy = when (policy) {
             "on_request" -> "on-request"
             "on-failure", "on_failure" -> "on-failure"
@@ -491,27 +436,48 @@ class CodexSessionService(private val project: Project) : Disposable {
 
     private fun readAuth(): AuthInfo? {
         return try {
-            val home = System.getProperty("user.home") ?: return null
-            val f = java.nio.file.Paths.get(home, ".codex", "auth.json").toFile()
-            if (!f.isFile) return null
+            // Respect CODEX_HOME if set; otherwise default to ~/.codex
+            val codexHome = System.getenv("CODEX_HOME")
+                ?.takeIf { it.isNotBlank() }
+                ?: (System.getProperty("user.home")?.let { java.nio.file.Paths.get(it, ".codex").toString() }
+                    ?: return null)
+            val f = java.nio.file.Paths.get(codexHome, "auth.json").toFile()
+            if (!f.isFile) {
+                // Fall back to env var if no auth.json exists, matching server behavior
+                val envKey = System.getenv("OPENAI_API_KEY")
+                return if (!envKey.isNullOrBlank()) AuthInfo("api_key", null, null) else null
+            }
             val json = f.readText()
             val obj = JsonParser.parseString(json).asJsonObject
-            val apiKey = obj.get("OPENAI_API_KEY")?.asString
-            val tokens = obj.get("tokens")?.asJsonObject
-            if (!apiKey.isNullOrBlank()) {
-                return AuthInfo("api_key", null, null)
+            val apiKey = obj.get("OPENAI_API_KEY").let { el ->
+                if (el == null || el.isJsonNull) null else runCatching { el.asString }.getOrNull()
             }
-            if (tokens != null) {
-                val idToken = tokens.get("id_token")?.asString
+            val tokensObj = obj.get("tokens").let { el ->
+                if (el == null || el.isJsonNull || !el.isJsonObject) null else el.asJsonObject
+            }
+
+            // Prefer ChatGPT tokens when present; otherwise fall back to API key.
+            if (tokensObj != null) {
+                val idToken = tokensObj.get("id_token").let { el ->
+                    if (el == null || el.isJsonNull) null else runCatching { el.asString }.getOrNull()
+                }
                 val info = parseJwtClaims(idToken)
-                val email = info?.get("email")?.asString
-                val plan = info?.getAsJsonObject("https://api.openai.com/auth")
-                    ?.get("chatgpt_plan_type")?.asString
+                val email = info?.get("email").let { el ->
+                    if (el == null || el.isJsonNull) null else runCatching { el.asString }.getOrNull()
+                }
+                val authObj = info?.get("https://api.openai.com/auth").let { el ->
+                    if (el == null || el.isJsonNull || !el.isJsonObject) null else el.asJsonObject
+                }
+                val plan = authObj?.get("chatgpt_plan_type").let { el ->
+                    if (el == null || el.isJsonNull) null else runCatching { el.asString }.getOrNull()
+                }
                 val planTitle = plan?.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
                 return AuthInfo("chatgpt", email, planTitle)
             }
+            if (!apiKey.isNullOrBlank()) return AuthInfo("api_key", null, null)
             null
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            log.error("Could not read auth info", t)
             null
         }
     }
@@ -521,8 +487,12 @@ class CodexSessionService(private val project: Project) : Disposable {
         val parts = jwt.split('.')
         if (parts.size < 2) return null
         return try {
+            val payloadB64 = parts[1]
+            // Base64 URL-safe without padding; add '=' padding to make length a multiple of 4
+            val padLen = (4 - payloadB64.length % 4) % 4
+            val padded = payloadB64 + "=".repeat(padLen)
             val decoder = java.util.Base64.getUrlDecoder()
-            val payloadBytes = decoder.decode(parts[1])
+            val payloadBytes = decoder.decode(padded)
             val payloadStr = String(payloadBytes, StandardCharsets.UTF_8)
             JsonParser.parseString(payloadStr).asJsonObject
         } catch (_: Throwable) {
@@ -535,36 +505,15 @@ class CodexSessionService(private val project: Project) : Disposable {
         start()
     }
 
-    private fun sendSubmission(op: JsonObject) {
-        val payload = JsonObject().apply {
-            addProperty("id", UUID.randomUUID().toString())
-            add("op", op)
-        }
-        val line = payload.toString()
-        ApplicationManager.getApplication().executeOnPooledThread {
-            try {
-                val w = stdin
-                if (w == null) {
-                    listeners.forEach { it.onError("Codex is not running.") }
-                } else {
-                    w.append(line)
-                    w.append('\n')
-                    w.flush()
-                }
-            } catch (t: Throwable) {
-                log.warn("Failed to write to codex stdin", t)
-                listeners.forEach { it.onError("Failed to send to codex: ${t.message}") }
-            }
-        }
+    private fun sendSubmission(op: Op) {
+        val submission = Submission(id = UUID.randomUUID().toString(), op = op)
+        val line = jsonOut.encodeToString(Submission.serializer(), submission)
+        transport.sendRaw(line)
     }
 
     override fun dispose() {
-        try {
-            processHandler?.destroyProcess()
-        } catch (_: Throwable) {
-        }
-        processHandler = null
-        stdin = null
+        transport.removeListener(this)
+        try { transport.dispose() } catch (_: Throwable) {}
     }
 
     private inline fun safeSwing(crossinline r: () -> Unit) {

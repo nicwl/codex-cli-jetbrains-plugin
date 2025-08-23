@@ -112,8 +112,6 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
             inputIm.put(ksPause, "codex-interrupt")
             inputIm.put(ksCancel, "codex-interrupt")
         }
-
-        chat.addNote("Codex: ready. Click Start or type and Send.")
         updateTokenStatus()
     }
 
