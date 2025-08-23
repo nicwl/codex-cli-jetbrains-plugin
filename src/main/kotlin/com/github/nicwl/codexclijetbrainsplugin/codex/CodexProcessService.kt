@@ -113,6 +113,7 @@ class CodexProcessService(private val project: Project) : Disposable {
     }
 
     private fun handleStdoutLine(line: String) {
+        log.warn("codex stdout: $line")
         val ev: Event = try {
             jsonCodec.decodeFromString(Event.serializer(), line)
         } catch (e: SerializationException) {

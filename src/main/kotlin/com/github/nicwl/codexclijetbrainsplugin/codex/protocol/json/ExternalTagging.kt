@@ -67,13 +67,6 @@ open class ExternalTaggingSerializer<T : Any>(
     }
 }
 
-private class LazyDelegateSerializer<T>(private val supplier: () -> KSerializer<T>) : KSerializer<T> {
-    private val delegate: KSerializer<T> by lazy(supplier)
-    override val descriptor: SerialDescriptor get() = delegate.descriptor
-    override fun deserialize(decoder: kotlinx.serialization.encoding.Decoder): T = delegate.deserialize(decoder)
-    override fun serialize(encoder: kotlinx.serialization.encoding.Encoder, value: T) = delegate.serialize(encoder, value)
-}
-
 /** Convenience factory so you can write: ExternalTagging.forType(Shape::class) */
 object ExternalTagging {
     @OptIn(InternalSerializationApi::class)

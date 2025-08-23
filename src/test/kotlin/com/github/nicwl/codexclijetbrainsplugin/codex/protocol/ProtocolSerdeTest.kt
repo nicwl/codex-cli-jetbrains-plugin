@@ -198,29 +198,17 @@ class ProtocolSerdeTest {
         assertEncodesTo(err, er, Event.serializer())
     }
 
-    // ── Externally tagged enums directly ──────────────────────────────────────
-    @Test fun file_change_external_decode_and_encode() {
-        val addS = """{"add":{"content":"x"}}"""
-        val add = json.decodeFromString(FileChangeExternalSerializer, addS)
-        assertEquals(EventMsg.FileChange.Add("x"), add)
-        assertEncodesTo(addS, add, FileChangeExternalSerializer)
-
-        val delS = """{"delete":null}"""
-        val del = json.decodeFromString(FileChangeExternalSerializer, delS)
-        assertEquals(EventMsg.FileChange.Delete, del)
-        assertEncodesTo(delS, del, FileChangeExternalSerializer)
-
-        val updS = """{"update":{"unified_diff":"d"}}"""
-        val upd = json.decodeFromString(FileChangeExternalSerializer, updS)
-        assertEquals(EventMsg.FileChange.Update("d", null), upd)
-        assertEncodesTo(updS, upd, FileChangeExternalSerializer)
+    // ── Externally tagged enums handled via EventMsg (no per-type serializer required) ──
+    @Test fun file_change_external_via_eventmsg() {
+        val msg = """{"type":"apply_patch_approval_request","call_id":"c","changes":{"a":{"add":{"content":"x"}},"b":{"delete":null},"c":{"update":{"unified_diff":"d"}}}}"""
+        val m = json.decodeFromString(EventMsg.serializer(), msg)
+        assertEncodesTo(msg, m, EventMsg.serializer())
     }
 
-    @Test fun parsed_command_external_decode_and_encode() {
-        val s = """{"Read":{"cmd":"cat","name":"file"}}"""
-        val pc = json.decodeFromString(ParsedCommandExternalSerializer, s)
-        assertEquals(EventMsg.ParsedCommand.Read("cat","file"), pc)
-        assertEncodesTo(s, pc, ParsedCommandExternalSerializer)
+    @Test fun parsed_command_external_via_eventmsg() {
+        val msg = """{"type":"exec_command_begin","call_id":"cid","command":["echo","hi"],"cwd":"/tmp","parsed_cmd":[{"Unknown":{"cmd":"echo hi"}}]}"""
+        val m = json.decodeFromString(EventMsg.serializer(), msg)
+        assertEncodesTo(msg, m, EventMsg.serializer())
     }
 
     @Test fun mcp_tool_call_result_external_decode_and_encode() {

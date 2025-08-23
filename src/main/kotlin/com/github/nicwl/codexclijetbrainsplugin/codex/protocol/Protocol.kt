@@ -15,8 +15,10 @@ import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.JsonEncoder
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.int
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.MapSerializer
 import kotlinx.serialization.builtins.serializer
@@ -123,8 +125,7 @@ sealed class EventMsg {
         @SerialName("call_id") val callId: String,
         val command: List<String>,
         val cwd: String,
-        @Serializable(with = ParsedCommandListExternalSerializer::class)
-        @SerialName("parsed_cmd") val parsedCmd: List<ParsedCommand> = emptyList(),
+        @Serializable(with = ParsedCommandListExternalSerializer::class) @SerialName("parsed_cmd") val parsedCmd: List<ParsedCommand> = emptyList(),
     ) : EventMsg()
 
     @Serializable
@@ -133,7 +134,7 @@ sealed class EventMsg {
         @SerialName("call_id") val callId: String,
         val stream: ExecOutputStream,
         // Matches serde_bytes::ByteBuf JSON representation (array of numbers)
-        val chunk: ByteArray,
+        val chunk: ImmutableBytes,
     ) : EventMsg()
 
     @Serializable
@@ -149,7 +150,9 @@ sealed class EventMsg {
     @Serializable
     enum class ExecOutputStream {
         @SerialName("stdout")
-        Stdout, @SerialName("stderr")
+        Stdout,
+
+        @SerialName("stderr")
         Stderr
     }
 
@@ -167,8 +170,7 @@ sealed class EventMsg {
     @SerialName("apply_patch_approval_request")
     data class ApplyPatchApprovalRequest(
         @SerialName("call_id") val callId: String,
-        @Serializable(with = FileChangeMapExternalSerializer::class)
-        val changes: Map<String, FileChange>,
+        @Serializable(with = FileChangeMapExternalSerializer::class) val changes: Map<String, FileChange>,
         val reason: String? = null,
         @SerialName("grant_root") val grantRoot: String? = null,
     ) : EventMsg()
@@ -179,8 +181,7 @@ sealed class EventMsg {
     data class PatchApplyBegin(
         @SerialName("call_id") val callId: String,
         @SerialName("auto_approved") val autoApproved: Boolean,
-        @Serializable(with = FileChangeMapExternalSerializer::class)
-        val changes: Map<String, FileChange>,
+        @Serializable(with = FileChangeMapExternalSerializer::class) val changes: Map<String, FileChange>,
     ) : EventMsg()
 
     @Serializable
@@ -241,7 +242,9 @@ sealed class EventMsg {
     @Serializable
     enum class TurnAbortReason {
         @SerialName("interrupted")
-        Interrupted, @SerialName("replaced")
+        Interrupted,
+
+        @SerialName("replaced")
         Replaced
     }
 
@@ -271,28 +274,37 @@ sealed class EventMsg {
     @Serializable
     @JsonClassDiscriminator("type")
     sealed class ParsedCommand {
-        @Serializable @SerialName("Read")
+        @Serializable
+        @SerialName("Read")
         data class Read(val cmd: String, val name: String) : ParsedCommand()
 
-        @Serializable @SerialName("ListFiles")
+        @Serializable
+        @SerialName("ListFiles")
         data class ListFiles(val cmd: String, val path: String? = null) : ParsedCommand()
 
-        @Serializable @SerialName("Search")
+        @Serializable
+        @SerialName("Search")
         data class Search(val cmd: String, val query: String? = null, val path: String? = null) : ParsedCommand()
 
-        @Serializable @SerialName("Format")
-        data class Format(val cmd: String, val tool: String? = null, val targets: List<String>? = null) : ParsedCommand()
+        @Serializable
+        @SerialName("Format")
+        data class Format(val cmd: String, val tool: String? = null, val targets: List<String>? = null) :
+            ParsedCommand()
 
-        @Serializable @SerialName("Test")
+        @Serializable
+        @SerialName("Test")
         data class Test(val cmd: String) : ParsedCommand()
 
-        @Serializable @SerialName("Lint")
+        @Serializable
+        @SerialName("Lint")
         data class Lint(val cmd: String, val tool: String? = null, val targets: List<String>? = null) : ParsedCommand()
 
-        @Serializable @SerialName("Noop")
+        @Serializable
+        @SerialName("Noop")
         data class Noop(val cmd: String) : ParsedCommand()
 
-        @Serializable @SerialName("Unknown")
+        @Serializable
+        @SerialName("Unknown")
         data class Unknown(val cmd: String) : ParsedCommand()
     }
 
@@ -311,8 +323,12 @@ sealed class EventMsg {
     @Serializable
     enum class StepStatus {
         @SerialName("pending")
-        Pending, @SerialName("in_progress")
-        InProgress, @SerialName("completed")
+        Pending,
+
+        @SerialName("in_progress")
+        InProgress,
+
+        @SerialName("completed")
         Completed
     }
 
@@ -330,8 +346,11 @@ data class CallToolResult(
 // ───────── Custom serializers for external-tagged enums from Rust ─────────
 
 // Legacy explicit serializers avoid init-order cycles when the sealed class references its own serializer
-object ParsedCommandExternalSerializer : KSerializer<EventMsg.ParsedCommand> by ExternalTagging.forType(EventMsg.ParsedCommand::class)
-object ParsedCommandListExternalSerializer : KSerializer<List<EventMsg.ParsedCommand>> by ListSerializer(ParsedCommandExternalSerializer)
+object ParsedCommandExternalSerializer :
+    KSerializer<EventMsg.ParsedCommand> by ExternalTagging.forType(EventMsg.ParsedCommand::class)
+
+object ParsedCommandListExternalSerializer :
+    KSerializer<List<EventMsg.ParsedCommand>> by ListSerializer(ParsedCommandExternalSerializer)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Outgoing submissions (SQ) – mirrors Rust Submission/Op shapes
@@ -342,13 +361,16 @@ data class Submission(val id: String, val op: Op)
 
 @Serializable
 sealed class Op {
-    @Serializable @SerialName("interrupt")
+    @Serializable
+    @SerialName("interrupt")
     data object Interrupt : Op()
 
-    @Serializable @SerialName("user_input")
+    @Serializable
+    @SerialName("user_input")
     data class UserInput(val items: List<InputItem>) : Op()
 
-    @Serializable @SerialName("user_turn")
+    @Serializable
+    @SerialName("user_turn")
     data class UserTurn(
         val items: List<InputItem>,
         val cwd: String,
@@ -359,7 +381,8 @@ sealed class Op {
         @kotlinx.serialization.EncodeDefault val summary: ReasoningSummary = ReasoningSummary.Auto,
     ) : Op()
 
-    @Serializable @SerialName("override_turn_context")
+    @Serializable
+    @SerialName("override_turn_context")
     data class OverrideTurnContext(
         val cwd: String? = null,
         @SerialName("approval_policy") val approvalPolicy: AskForApproval? = null,
@@ -369,63 +392,123 @@ sealed class Op {
         val summary: ReasoningSummary? = null,
     ) : Op()
 
-    @Serializable @SerialName("exec_approval")
+    @Serializable
+    @SerialName("exec_approval")
     data class ExecApproval(val id: String, val decision: ReviewDecision) : Op()
 
-    @Serializable @SerialName("patch_approval")
+    @Serializable
+    @SerialName("patch_approval")
     data class PatchApproval(val id: String, val decision: ReviewDecision) : Op()
 
-    @Serializable @SerialName("add_to_history")
+    @Serializable
+    @SerialName("add_to_history")
     data class AddToHistory(val text: String) : Op()
 
-    @Serializable @SerialName("get_history_entry_request")
+    @Serializable
+    @SerialName("get_history_entry_request")
     data class GetHistoryEntryRequest(val offset: Int, @SerialName("log_id") val logId: Long) : Op()
 
-    @Serializable @SerialName("list_mcp_tools")
+    @Serializable
+    @SerialName("list_mcp_tools")
     data object ListMcpTools : Op()
 
-    @Serializable @SerialName("compact")
+    @Serializable
+    @SerialName("compact")
     data object Compact : Op()
 
-    @Serializable @SerialName("shutdown")
+    @Serializable
+    @SerialName("shutdown")
     data object Shutdown : Op()
 }
 
 @Serializable
 sealed class InputItem {
-    @Serializable @SerialName("text") data class Text(val text: String) : InputItem()
-    @Serializable @SerialName("image") data class Image(@SerialName("image_url") val imageUrl: String) : InputItem()
-    @Serializable @SerialName("local_image") data class LocalImage(val path: String) : InputItem()
+    @Serializable
+    @SerialName("text")
+    data class Text(val text: String) : InputItem()
+
+    @Serializable
+    @SerialName("image")
+    data class Image(@SerialName("image_url") val imageUrl: String) : InputItem()
+
+    @Serializable
+    @SerialName("local_image")
+    data class LocalImage(val path: String) : InputItem()
 }
 
 @Serializable
 enum class ReviewDecision {
-    @SerialName("approved") Approved,
-    @SerialName("approved_for_session") ApprovedForSession,
-    @SerialName("denied") Denied,
-    @SerialName("abort") Abort,
+    @SerialName("approved")
+    Approved,
+
+    @SerialName("approved_for_session")
+    ApprovedForSession,
+
+    @SerialName("denied")
+    Denied,
+
+    @SerialName("abort")
+    Abort,
 }
 
 @Serializable
 enum class AskForApproval {
-    @SerialName("untrusted") UnlessTrusted,
-    @SerialName("on-failure") OnFailure,
-    @SerialName("on-request") OnRequest,
-    @SerialName("never") Never,
+    @SerialName("untrusted")
+    UnlessTrusted,
+
+    @SerialName("on-failure")
+    OnFailure,
+
+    @SerialName("on-request")
+    OnRequest,
+
+    @SerialName("never")
+    Never,
 }
 
 @Serializable
-enum class ReasoningEffort { @SerialName("minimal") Minimal, @SerialName("low") Low, @SerialName("medium") Medium, @SerialName("high") High }
+enum class ReasoningEffort {
+    @SerialName("minimal")
+    Minimal,
+
+    @SerialName("low")
+    Low,
+
+    @SerialName("medium")
+    Medium,
+
+    @SerialName("high")
+    High
+}
 
 @Serializable
-enum class ReasoningSummary { @SerialName("auto") Auto, @SerialName("concise") Concise, @SerialName("detailed") Detailed, @SerialName("none") None }
+enum class ReasoningSummary {
+    @SerialName("auto")
+    Auto,
+
+    @SerialName("concise")
+    Concise,
+
+    @SerialName("detailed")
+    Detailed,
+
+    @SerialName("none")
+    None
+}
 
 @Serializable
 @JsonClassDiscriminator("mode")
 sealed class SandboxPolicy {
-    @Serializable @SerialName("danger-full-access") data object DangerFullAccess : SandboxPolicy()
-    @Serializable @SerialName("read-only") data object ReadOnly : SandboxPolicy()
-    @Serializable @SerialName("workspace-write")
+    @Serializable
+    @SerialName("danger-full-access")
+    data object DangerFullAccess : SandboxPolicy()
+
+    @Serializable
+    @SerialName("read-only")
+    data object ReadOnly : SandboxPolicy()
+
+    @Serializable
+    @SerialName("workspace-write")
     data class WorkspaceWrite(
         @SerialName("writable_roots") val writableRoots: List<String> = emptyList(),
         @kotlinx.serialization.EncodeDefault @SerialName("network_access") val networkAccess: Boolean = false,
@@ -434,8 +517,11 @@ sealed class SandboxPolicy {
     ) : SandboxPolicy()
 }
 
-object FileChangeExternalSerializer : KSerializer<EventMsg.FileChange> by ExternalTagging.forType(EventMsg.FileChange::class)
-object FileChangeMapExternalSerializer : KSerializer<Map<String, EventMsg.FileChange>> by MapSerializer(String.serializer(), FileChangeExternalSerializer)
+object FileChangeExternalSerializer :
+    KSerializer<EventMsg.FileChange> by ExternalTagging.forType(EventMsg.FileChange::class)
+
+object FileChangeMapExternalSerializer :
+    KSerializer<Map<String, EventMsg.FileChange>> by MapSerializer(String.serializer(), FileChangeExternalSerializer)
 
 object McpToolCallResultSerializer : KSerializer<EventMsg.McpToolCallResult> {
     override val descriptor = kotlinx.serialization.descriptors.buildClassSerialDescriptor("McpToolCallResult")
@@ -446,7 +532,12 @@ object McpToolCallResultSerializer : KSerializer<EventMsg.McpToolCallResult> {
         require(obj.size == 1) { "McpToolCallResult expects single-key object, got ${obj.keys}" }
         val (tag, payload) = obj.entries.first()
         return when (tag) {
-            "Ok" -> EventMsg.McpToolCallResult.Ok(value = input.json.decodeFromJsonElement(CallToolResult.serializer(), payload))
+            "Ok" -> EventMsg.McpToolCallResult.Ok(
+                value = input.json.decodeFromJsonElement(
+                    CallToolResult.serializer(), payload
+                )
+            )
+
             "Err" -> EventMsg.McpToolCallResult.Err(error = payload.jsonPrimitive.content)
             else -> EventMsg.McpToolCallResult.Err(error = payload.toString())
         }
@@ -455,9 +546,62 @@ object McpToolCallResultSerializer : KSerializer<EventMsg.McpToolCallResult> {
     override fun serialize(encoder: Encoder, value: EventMsg.McpToolCallResult) {
         val output = encoder as JsonEncoder
         val json = when (value) {
-            is EventMsg.McpToolCallResult.Ok -> JsonObject(mapOf("Ok" to output.json.encodeToJsonElement(CallToolResult.serializer(), value.value)))
+            is EventMsg.McpToolCallResult.Ok -> JsonObject(
+                mapOf(
+                    "Ok" to output.json.encodeToJsonElement(
+                        CallToolResult.serializer(), value.value
+                    )
+                )
+            )
+
             is EventMsg.McpToolCallResult.Err -> JsonObject(mapOf("Err" to JsonPrimitive(value.error)))
         }
         output.encodeJsonElement(json)
+    }
+}
+
+// Immutable bytes wrapper with JSON array-of-numbers representation
+@Serializable(with = ImmutableBytesSerializer::class)
+class ImmutableBytes private constructor(private val data: ByteArray) {
+    companion object {
+        fun from(bytes: ByteArray): ImmutableBytes = ImmutableBytes(bytes.copyOf())
+        fun of(vararg values: Int): ImmutableBytes = ImmutableBytes(values.map { it.toByte() }.toByteArray())
+    }
+
+    fun toByteArray(): ByteArray = data.copyOf()
+    val size: Int get() = data.size
+    operator fun get(index: Int): Int = data[index].toInt() and 0xFF
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is ImmutableBytes) return false
+        return data.contentEquals(other.data)
+    }
+
+    override fun hashCode(): Int = data.contentHashCode()
+    override fun toString(): String = "ImmutableBytes(size=$size)"
+}
+
+object ImmutableBytesSerializer : KSerializer<ImmutableBytes> {
+    override val descriptor = kotlinx.serialization.descriptors.buildClassSerialDescriptor("ImmutableBytes")
+
+    override fun deserialize(decoder: Decoder): ImmutableBytes {
+        val input = decoder as JsonDecoder
+        val elem = input.decodeJsonElement()
+        val arr = elem as? JsonArray ?: error("ImmutableBytes expects JSON array")
+        val bytes = ByteArray(arr.size)
+        var i = 0
+        for (e in arr) {
+            val v = e.jsonPrimitive.int
+            require(v in 0..255) { "byte out of range: $v" }
+            bytes[i++] = v.toByte()
+        }
+        return ImmutableBytes.from(bytes)
+    }
+
+    override fun serialize(encoder: Encoder, value: ImmutableBytes) {
+        val output = encoder as JsonEncoder
+        val arr = value.toByteArray().map { JsonPrimitive(it.toInt() and 0xFF) }
+        output.encodeJsonElement(JsonArray(arr))
     }
 }
