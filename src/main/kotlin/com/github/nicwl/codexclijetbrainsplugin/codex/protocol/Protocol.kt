@@ -355,8 +355,8 @@ sealed class Op {
         @SerialName("approval_policy") val approvalPolicy: AskForApproval,
         @SerialName("sandbox_policy") val sandboxPolicy: SandboxPolicy,
         val model: String,
-        val effort: ReasoningEffort = ReasoningEffort.Medium,
-        val summary: ReasoningSummary = ReasoningSummary.Auto,
+        @kotlinx.serialization.EncodeDefault val effort: ReasoningEffort = ReasoningEffort.Medium,
+        @kotlinx.serialization.EncodeDefault val summary: ReasoningSummary = ReasoningSummary.Auto,
     ) : Op()
 
     @Serializable @SerialName("override_turn_context")
@@ -428,9 +428,9 @@ sealed class SandboxPolicy {
     @Serializable @SerialName("workspace-write")
     data class WorkspaceWrite(
         @SerialName("writable_roots") val writableRoots: List<String> = emptyList(),
-        @SerialName("network_access") val networkAccess: Boolean = false,
-        @SerialName("exclude_tmpdir_env_var") val excludeTmpdirEnvVar: Boolean = false,
-        @SerialName("exclude_slash_tmp") val excludeSlashTmp: Boolean = false,
+        @kotlinx.serialization.EncodeDefault @SerialName("network_access") val networkAccess: Boolean = false,
+        @kotlinx.serialization.EncodeDefault @SerialName("exclude_tmpdir_env_var") val excludeTmpdirEnvVar: Boolean = false,
+        @kotlinx.serialization.EncodeDefault @SerialName("exclude_slash_tmp") val excludeSlashTmp: Boolean = false,
     ) : SandboxPolicy()
 }
 

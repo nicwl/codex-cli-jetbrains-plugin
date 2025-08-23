@@ -1,6 +1,7 @@
 package com.github.nicwl.codexclijetbrainsplugin.codex.protocol.json
 
 import kotlinx.serialization.KSerializer
+import kotlinx.serialization.descriptors.SerialDescriptor
 import kotlinx.serialization.json.*
 import kotlin.reflect.KClass
 import kotlinx.serialization.serializer
@@ -11,12 +12,15 @@ import kotlinx.serialization.InternalSerializationApi
  * Works with any T that itself is serialized as internally-tagged with `typeKey`.
  */
 open class ExternalTaggingSerializer<T : Any>(
-    delegateSupplier: () -> KSerializer<T>,
+    private val delegateSupplier: () -> KSerializer<T>,
     private val typeKey: String = "type",
     private val unitPayloads: Set<JsonElement> = setOf(JsonNull, JsonObject(emptyMap()))
-) : JsonTransformingSerializer<T>(LazyDelegateSerializer(delegateSupplier)) {
+) : KSerializer<T> {
 
-    override fun transformDeserialize(element: JsonElement): JsonElement {
+    private val delegate: KSerializer<T> by lazy(delegateSupplier)
+    override val descriptor: SerialDescriptor by lazy { delegate.descriptor }
+
+    private fun transformDeserialize(element: JsonElement): JsonElement {
         val obj = element as? JsonObject ?: return element
         if (obj.size != 1) return element
         val (tag, payload) = obj.entries.first()
@@ -38,30 +42,34 @@ open class ExternalTaggingSerializer<T : Any>(
         }
     }
 
-    override fun transformSerialize(element: JsonElement): JsonElement {
+    private fun transformSerialize(element: JsonElement): JsonElement {
         val obj = element as? JsonObject ?: return element
         val tag = obj[typeKey]?.jsonPrimitive?.content ?: return element
         val rest = obj.toMutableMap().also { it.remove(typeKey) }
         val payload: JsonElement = if (rest.isEmpty()) JsonNull else JsonObject(rest)
         return buildJsonObject { put(tag, payload) }
     }
+
+    override fun deserialize(decoder: kotlinx.serialization.encoding.Decoder): T {
+        val input = decoder as? JsonDecoder
+            ?: return delegate.deserialize(decoder)
+        val element = input.decodeJsonElement()
+        val transformed = transformDeserialize(element)
+        return input.json.decodeFromJsonElement(delegate, transformed)
+    }
+
+    override fun serialize(encoder: kotlinx.serialization.encoding.Encoder, value: T) {
+        val output = encoder as? JsonEncoder
+            ?: return delegate.serialize(encoder, value)
+        val element = output.json.encodeToJsonElement(delegate, value)
+        val transformed = transformSerialize(element)
+        output.encodeJsonElement(transformed)
+    }
 }
 
 private class LazyDelegateSerializer<T>(private val supplier: () -> KSerializer<T>) : KSerializer<T> {
     private val delegate: KSerializer<T> by lazy(supplier)
-    override val descriptor = object : kotlinx.serialization.descriptors.SerialDescriptor {
-        // Let descriptor query lazily to avoid premature initialization
-        private val real by lazy { delegate.descriptor }
-        override val serialName get() = real.serialName
-        override val kind get() = real.kind
-        override val elementsCount get() = real.elementsCount
-        override fun getElementName(index: Int) = real.getElementName(index)
-        override fun getElementIndex(name: String) = real.getElementIndex(name)
-        override fun isElementOptional(index: Int) = real.isElementOptional(index)
-        override fun getElementDescriptor(index: Int) = real.getElementDescriptor(index)
-        override fun getElementAnnotations(index: Int) = real.getElementAnnotations(index)
-        override val annotations get() = real.annotations
-    }
+    override val descriptor: SerialDescriptor get() = delegate.descriptor
     override fun deserialize(decoder: kotlinx.serialization.encoding.Decoder): T = delegate.deserialize(decoder)
     override fun serialize(encoder: kotlinx.serialization.encoding.Encoder, value: T) = delegate.serialize(encoder, value)
 }

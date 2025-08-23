@@ -201,26 +201,26 @@ class ProtocolSerdeTest {
     // ── Externally tagged enums directly ──────────────────────────────────────
     @Test fun file_change_external_decode_and_encode() {
         val addS = """{"add":{"content":"x"}}"""
-        val add = json.decodeFromString(EventMsg.FileChange.serializer(), addS)
+        val add = json.decodeFromString(FileChangeExternalSerializer, addS)
         assertEquals(EventMsg.FileChange.Add("x"), add)
-        assertEncodesTo(addS, add, EventMsg.FileChange.serializer())
+        assertEncodesTo(addS, add, FileChangeExternalSerializer)
 
         val delS = """{"delete":null}"""
-        val del = json.decodeFromString(EventMsg.FileChange.serializer(), delS)
+        val del = json.decodeFromString(FileChangeExternalSerializer, delS)
         assertEquals(EventMsg.FileChange.Delete, del)
-        assertEncodesTo(delS, del, EventMsg.FileChange.serializer())
+        assertEncodesTo(delS, del, FileChangeExternalSerializer)
 
         val updS = """{"update":{"unified_diff":"d"}}"""
-        val upd = json.decodeFromString(EventMsg.FileChange.serializer(), updS)
+        val upd = json.decodeFromString(FileChangeExternalSerializer, updS)
         assertEquals(EventMsg.FileChange.Update("d", null), upd)
-        assertEncodesTo(updS, upd, EventMsg.FileChange.serializer())
+        assertEncodesTo(updS, upd, FileChangeExternalSerializer)
     }
 
     @Test fun parsed_command_external_decode_and_encode() {
         val s = """{"Read":{"cmd":"cat","name":"file"}}"""
-        val pc = json.decodeFromString(EventMsg.ParsedCommand.serializer(), s)
+        val pc = json.decodeFromString(ParsedCommandExternalSerializer, s)
         assertEquals(EventMsg.ParsedCommand.Read("cat","file"), pc)
-        assertEncodesTo(s, pc, EventMsg.ParsedCommand.serializer())
+        assertEncodesTo(s, pc, ParsedCommandExternalSerializer)
     }
 
     @Test fun mcp_tool_call_result_external_decode_and_encode() {
