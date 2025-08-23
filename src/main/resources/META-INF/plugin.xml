@@ -9,7 +9,7 @@
     <resource-bundle>messages.MyBundle</resource-bundle>
 
     <extensions defaultExtensionNs="com.intellij">
-        <toolWindow factoryClass="com.github.nicwl.codexclijetbrainsplugin.toolWindow.MyToolWindowFactory" id="MyToolWindow"/>
-        <postStartupActivity implementation="com.github.nicwl.codexclijetbrainsplugin.startup.MyProjectActivity" />
+        <toolWindow factoryClass="com.github.nicwl.codexclijetbrainsplugin.toolWindow.CodexToolWindowFactory" id="Codex" anchor="right"/>
+        <applicationConfigurable instance="com.github.nicwl.codexclijetbrainsplugin.settings.CodexSettingsConfigurable" id="com.github.nicwl.codex.settings" displayName="Codex CLI"/>
     </extensions>
 </idea-plugin>
