@@ -4,3 +4,6 @@
 [submodule "intellij-sdk-docs"]
 	path = intellij-sdk-docs
 	url = https://github.com/JetBrains/intellij-sdk-docs
+[submodule "intellij-community"]
+	path = intellij-community
+	url = https://github.com/JetBrains/intellij-community.git

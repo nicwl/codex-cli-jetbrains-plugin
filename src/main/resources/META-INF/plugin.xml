@@ -2,7 +2,7 @@
 <idea-plugin>
     <id>com.github.nicwl.codexclijetbrainsplugin</id>
     <name>codex-cli-jetbrains-plugin</name>
-    <vendor>nicwl</vendor>
+    <vendor url="https://github.com/nicwl/codex-cli-jetbrains-plugin">nicwl</vendor>
 
     <depends>com.intellij.modules.platform</depends>
 

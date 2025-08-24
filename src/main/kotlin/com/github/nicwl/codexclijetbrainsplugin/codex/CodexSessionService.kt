@@ -12,6 +12,11 @@ import com.intellij.openapi.components.Service
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
+import com.intellij.notification.NotificationGroupManager
+import com.intellij.notification.NotificationType
+import com.intellij.notification.NotificationAction
+import com.intellij.openapi.wm.ToolWindowManager
+import com.github.nicwl.codexclijetbrainsplugin.MyBundle
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
@@ -139,19 +144,21 @@ class CodexSessionService(private val project: Project) : Disposable, CodexTrans
                         return
                     }
 
-                    val title = "Codex: Task complete"
+                    val title = MyBundle.message("notification.taskComplete.title")
                     val content = msg.lastAgentMessage?.trim()?.takeIf { it.isNotEmpty() }?.take(300)
 
                     // Show a notification when IDE not focused or tool window is hidden.
                     // The IDE will use system notifications if enabled in settings for this group.
                     if (!isIdeActive || !toolVisible) {
-                        val group = com.intellij.notification.NotificationGroupManager.getInstance()
-                            .getNotificationGroup("Codex Notifications")
+                        val group = NotificationGroupManager.getInstance().getNotificationGroup("Codex Notifications")
                         val n = if (content == null) {
-                            group.createNotification(title, com.intellij.notification.NotificationType.INFORMATION)
+                            group.createNotification(title, NotificationType.INFORMATION)
                         } else {
-                            group.createNotification(title, content, com.intellij.notification.NotificationType.INFORMATION)
+                            group.createNotification(title, content, NotificationType.INFORMATION)
                         }
+                        n.addAction(NotificationAction.createSimple(MyBundle.message("notification.openToolWindow.action")) {
+                            ToolWindowManager.getInstance(project).getToolWindow("Codex")?.activate(null, true)
+                        })
                         n.notify(project)
                     }
                 } catch (_: Throwable) {

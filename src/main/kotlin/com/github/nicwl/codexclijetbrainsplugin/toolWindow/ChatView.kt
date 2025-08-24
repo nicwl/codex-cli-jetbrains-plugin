@@ -4,6 +4,7 @@ import com.intellij.execution.process.AnsiEscapeDecoder
 import com.intellij.execution.process.ProcessOutputType
 import com.intellij.execution.ui.ConsoleViewContentType
 import com.intellij.openapi.project.Project
+import com.github.nicwl.codexclijetbrainsplugin.MyBundle
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.components.JBScrollBar
@@ -164,11 +165,11 @@ class ChatView(private val project: Project) : JPanel(BorderLayout()) {
 
     fun addMcpTools(tools: Map<String, String>) {
         if (tools.isEmpty()) {
-            addNote("[mcp] No tools configured.")
+            addNote(MyBundle.message("mcp.tools.none"))
             return
         }
         val sb = StringBuilder()
-        sb.append("[mcp] Tools:\n")
+        sb.append(MyBundle.message("mcp.tools.header")).append('\n')
         tools.forEach { (name, desc) ->
             if (desc.isNotBlank()) sb.append(" - ").append(name).append(": ").append(desc).append('\n')
             else sb.append(" - ").append(name).append('\n')
@@ -189,7 +190,7 @@ class ChatView(private val project: Project) : JPanel(BorderLayout()) {
     fun appendExecConsoleDelta(callId: String, isStdErr: Boolean, bytes: ByteArray) {
         val c = execConsoles[callId] ?: run {
             // If we somehow get output before begin, create a generic console
-            val fallback = ConsoleBubble("(process output)", project)
+            val fallback = ConsoleBubble(MyBundle.message("exec.fallback.title"), project)
             execConsoles[callId] = fallback
             content.add(fallback.row)
             fallback
@@ -201,7 +202,7 @@ class ChatView(private val project: Project) : JPanel(BorderLayout()) {
 
     fun endExecConsole(callId: String, exitCode: Int, durationSecs: Long, durationNanos: Int) {
         val c = execConsoles.remove(callId) ?: return
-        c.appendFooter("[exit code: $exitCode; duration: ${durationSecs}s ${durationNanos}ns]")
+        c.appendFooter(MyBundle.message("exec.footer", exitCode, durationSecs, durationNanos))
         refreshConsole(c)
         revalidateAndScroll()
     }

@@ -94,13 +94,8 @@ class CodexProcessService(private val project: Project) : Disposable {
                             val line = stderrBuffer.substring(0, idx).trim()
                             stderrBuffer.delete(0, idx + 1)
                             if (line.isNotEmpty()) {
-                                // codex proto writes logs to stderr; forward to our own stderr, not UI
-                                try {
-                                    System.err.println(line)
-                                } catch (_: Throwable) {
-                                    // fallback to idea logger
-                                    log.warn(line)
-                                }
+                                // codex proto writes logs to stderr; surface via IDE logger
+                                log.info(line)
                             }
                         }
                     }
@@ -113,7 +108,7 @@ class CodexProcessService(private val project: Project) : Disposable {
     }
 
     private fun handleStdoutLine(line: String) {
-        log.warn("codex stdout: $line")
+        log.debug("codex stdout: $line")
         val ev: Event = try {
             jsonCodec.decodeFromString(Event.serializer(), line)
         } catch (e: SerializationException) {

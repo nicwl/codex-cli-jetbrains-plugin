@@ -1,12 +1,16 @@
 package com.github.nicwl.codexclijetbrainsplugin.toolWindow
 
+import com.github.nicwl.codexclijetbrainsplugin.MyBundle
 import com.github.nicwl.codexclijetbrainsplugin.codex.CodexEventListener
 import com.github.nicwl.codexclijetbrainsplugin.codex.CodexSessionService
 import com.github.nicwl.codexclijetbrainsplugin.settings.CodexSettingsConfigurable
 import com.github.nicwl.codexclijetbrainsplugin.codex.CodexSettingsState
-// Console imports removed in favor of ChatView
 import com.intellij.icons.AllIcons
-import com.intellij.openapi.actionSystem.*
+import com.intellij.openapi.Disposable
+import com.intellij.openapi.actionSystem.ActionManager
+import com.intellij.openapi.actionSystem.DefaultActionGroup
+import com.intellij.openapi.actionSystem.KeyboardShortcut
+import com.intellij.openapi.actionSystem.CustomShortcutSet
 import com.intellij.openapi.options.ShowSettingsUtil
 import com.intellij.openapi.util.SystemInfo
 import com.intellij.openapi.application.ApplicationManager
@@ -21,29 +25,30 @@ import java.awt.event.KeyEvent
 import com.intellij.codeInsight.lookup.LookupManager
 import com.intellij.codeInsight.lookup.LookupElementBuilder
 import com.intellij.codeInsight.AutoPopupController
-import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.editor.ex.EditorEx
 import com.intellij.openapi.editor.EditorModificationUtil
-// keep single ApplicationManager import above
 import javax.swing.AbstractAction
 import javax.swing.JButton
 import javax.swing.JPanel
-import javax.swing.JToolBar
 import javax.swing.JLabel
 import javax.swing.BoxLayout
 import javax.swing.KeyStroke
 import com.intellij.openapi.editor.event.DocumentListener
 import com.intellij.openapi.editor.event.DocumentEvent
-import java.awt.KeyboardFocusManager
 import javax.swing.SwingUtilities
+import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.project.DumbAwareAction
+import com.intellij.openapi.progress.ProgressManager
+import com.intellij.openapi.progress.Task
+import com.intellij.openapi.progress.ProgressIndicator
 
-class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
+class CodexToolWindowPanel(private val project: Project) : CodexEventListener, Disposable {
     private val log = Logger.getInstance(CodexToolWindowPanel::class.java)
     private val session = project.getService(CodexSessionService::class.java)
     private val chat = ChatView(project)
     // Lazily initialize to ensure slashCommands is constructed first
     private val input: TextFieldWithAutoCompletion<String> by lazy { createSlashAutoCompleteField() }
-    private val statusLabel = JLabel("Tokens: total=0 input=0 (+ 0 cached) output=0 (reasoning 0)")
+    private val statusLabel = JLabel(MyBundle.message("status.tokens.initial"))
     private val tokenAgg = TokenAggregator()
     private var assistantStreaming = false
     private var lastAssistantFinal: String? = null
@@ -79,7 +84,7 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
             installEnterShortcut()
         }
         val inputPanel = JPanel(BorderLayout()).apply { border = JBUI.Borders.emptyTop(6) }
-        val sendButton = JButton("Send").apply {
+        val sendButton = JButton(MyBundle.message("button.send")).apply {
             addActionListener { sendCurrentInput() }
         }
         inputPanel.add(input, BorderLayout.CENTER)
@@ -96,9 +101,6 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
 
         // Ensure shortcut is registered even if settings provider didn't run yet
         installEnterShortcut()
-
-        // Global key dispatcher as a reliable fallback to catch Enter within our input
-        installGlobalEnterDispatcher()
 
         // Interrupt keybindings
         val interruptAction = object : AbstractAction() {
@@ -127,21 +129,20 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
         updateTokenStatus()
     }
 
-    private fun createToolbar(): JToolBar {
-        val toolbar = JToolBar().apply {
-            isFloatable = false
+    private fun createToolbar(): javax.swing.JComponent {
+        val settingsAction = object : DumbAwareAction(
+            MyBundle.message("action.settings"),
+            MyBundle.message("action.settings.description"),
+            AllIcons.General.Gear
+        ) {
+            override fun actionPerformed(e: AnActionEvent) {
+                ShowSettingsUtil.getInstance().showSettingsDialog(project, CodexSettingsConfigurable::class.java)
+            }
         }
-
-        fun addAction(text: String, icon: javax.swing.Icon?, action: () -> Unit) {
-            val btn = JButton(text, icon)
-            btn.addActionListener { action() }
-            toolbar.add(btn)
-        }
-
-        addAction("Settings", AllIcons.General.Gear) {
-            ShowSettingsUtil.getInstance().showSettingsDialog(project, CodexSettingsConfigurable::class.java)
-        }
-        return toolbar
+        val group = DefaultActionGroup().apply { add(settingsAction) }
+        val toolbar = ActionManager.getInstance().createActionToolbar("CodexToolbar", group, true)
+        toolbar.targetComponent = rootPanel
+        return toolbar.component
     }
 
     fun ensureStarted() {
@@ -247,29 +248,7 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
         sendOnEnter.registerCustomShortcutSet(com.intellij.openapi.actionSystem.CustomShortcutSet(shortcut), comp)
     }
 
-    private fun installGlobalEnterDispatcher() {
-        if (rootPanel.getClientProperty("codex-enter-dispatcher-installed") == true) return
-        rootPanel.putClientProperty("codex-enter-dispatcher-installed", true)
-        val dispatcher = java.awt.KeyEventDispatcher { e ->
-            if (e.id != java.awt.event.KeyEvent.KEY_PRESSED) return@KeyEventDispatcher false
-            if (e.keyCode != KeyEvent.VK_ENTER) return@KeyEventDispatcher false
-            val focus = KeyboardFocusManager.getCurrentKeyboardFocusManager().focusOwner
-            if (focus == null || !SwingUtilities.isDescendingFrom(focus, input)) return@KeyEventDispatcher false
-            val ed = input.editor
-            val lookupActive = ed != null && LookupManager.getActiveLookup(ed) != null
-            val shift = (e.modifiersEx and InputEvent.SHIFT_DOWN_MASK) != 0
-            if (!lookupActive && !shift) {
-                sendCurrentInput()
-                true
-            } else if (!lookupActive && shift) {
-                if (ed != null) EditorModificationUtil.insertStringAtCaret(ed, "\n")
-                true
-            } else {
-                false
-            }
-        }
-        KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(dispatcher)
-    }
+    // Removed global AWT KeyEventDispatcher; rely on per-component shortcuts.
 
     private fun handleSlashCommand(raw: String): Boolean {
         val parts = raw.trim().split(Regex("\\s+"))
@@ -277,7 +256,7 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
         val args = parts.drop(1)
         when (cmd) {
             "compact" -> {
-                chat.addNote("Compacting context…")
+                chat.addNote(MyBundle.message("chat.compact.note"))
                 session.sendCompact()
                 return true
             }
@@ -288,19 +267,19 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
             }
 
             "diff" -> {
-                chat.addNote("Computing git diff…")
+                chat.addNote(MyBundle.message("chat.diff.note"))
                 computeGitDiff()
                 return true
             }
 
             "mcp" -> {
-                chat.addNote("Listing MCP tools…")
+                chat.addNote(MyBundle.message("chat.mcp.note"))
                 session.sendListMcpTools()
                 return true
             }
 
             "new" -> {
-                chat.addNote("Starting new Codex session…")
+                chat.addNote(MyBundle.message("chat.new.note"))
                 session.restart()
                 tokenAgg.reset()
                 updateTokenStatus()
@@ -312,9 +291,9 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
             "model" -> {
                 val slug = args.firstOrNull()
                 if (slug.isNullOrBlank()) {
-                    chat.addNote("Usage: /model <slug>")
+                    chat.addNote(MyBundle.message("chat.model.usage"))
                 } else {
-                    chat.addNote("Switching model to ‘$slug’…")
+                    chat.addNote(MyBundle.message("chat.model.switch.note", slug))
                     session.sendOverrideModel(slug)
                 }
                 return true
@@ -329,13 +308,13 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
                     "never" -> "never"
                     else -> null
                 }
-                if (mapped == null) chat.addNote("Usage: /approvals <untrusted|on_request|on_failure|never>")
-                else { chat.addNote("Setting approval policy to ‘$mapped’…"); session.sendOverrideApproval(mapped) }
+                if (mapped == null) chat.addNote(MyBundle.message("chat.approvals.usage"))
+                else { chat.addNote(MyBundle.message("chat.approvals.set", mapped)); session.sendOverrideApproval(mapped) }
                 return true
             }
 
             "quit" -> {
-                chat.addNote("Close the Codex tool window to quit.")
+                chat.addNote(MyBundle.message("chat.quit.note"))
                 return true
             }
 
@@ -345,27 +324,31 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
 
     private fun computeGitDiff() {
         val baseDir = project.basePath
-        ApplicationManager.getApplication().executeOnPooledThread {
-            try {
-                val insideRepo = runCmd(listOf("git", "rev-parse", "--is-inside-work-tree"), baseDir).first
-                if (!insideRepo) {
-                    chat.addNote("`/diff` — not inside a git repository")
-                    return@executeOnPooledThread
+        ProgressManager.getInstance().run(object : Task.Backgroundable(project, MyBundle.message("chat.diff.note"), true) {
+            override fun run(indicator: ProgressIndicator) {
+                indicator.isIndeterminate = true
+                try {
+                    val insideRepo = runCmd(listOf("git", "rev-parse", "--is-inside-work-tree"), baseDir).first
+                    if (!insideRepo) {
+                        chat.addNote(MyBundle.message("diff.notRepo"))
+                        return
+                    }
+                    val tracked = runCmdCapture(listOf("git", "diff", "--color"), baseDir)
+                    val untrackedList = runCmdCapture(listOf("git", "ls-files", "--others", "--exclude-standard"), baseDir)
+                    val nullPath = if (System.getProperty("os.name").lowercase().contains("win")) "NUL" else "/dev/null"
+                    val untrackedDiff = StringBuilder()
+                    untrackedList.lines().map { it.trim() }.filter { it.isNotEmpty() }.forEach { file ->
+                        if (indicator.isCanceled) return
+                        val d = runCmdCapture(listOf("git", "diff", "--color", "--no-index", "--", nullPath, file), baseDir)
+                        untrackedDiff.append(d)
+                    }
+                    val out = tracked + untrackedDiff.toString()
+                    if (out.isBlank()) chat.addNote(MyBundle.message("diff.noChanges")) else chat.addDiff(out)
+                } catch (t: Throwable) {
+                    chat.addError(MyBundle.message("diff.failed", t.message ?: ""))
                 }
-                val tracked = runCmdCapture(listOf("git", "diff", "--color"), baseDir)
-                val untrackedList = runCmdCapture(listOf("git", "ls-files", "--others", "--exclude-standard"), baseDir)
-                val nullPath = if (System.getProperty("os.name").lowercase().contains("win")) "NUL" else "/dev/null"
-                val untrackedDiff = StringBuilder()
-                untrackedList.lines().map { it.trim() }.filter { it.isNotEmpty() }.forEach { file ->
-                    val d = runCmdCapture(listOf("git", "diff", "--color", "--no-index", "--", nullPath, file), baseDir)
-                    untrackedDiff.append(d)
-                }
-                val out = tracked + untrackedDiff.toString()
-                if (out.isBlank()) chat.addNote("[diff] (no changes)") else chat.addDiff(out)
-            } catch (t: Throwable) {
-                chat.addError("Failed to compute diff: ${t.message}")
             }
-        }
+        })
     }
 
     private fun runCmdCapture(cmd: List<String>, dir: String?): String {
@@ -390,7 +373,7 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
 
     // CodexEventListener implementation
     override fun onConnected(model: String) {
-        chat.addNote("Connected to model: $model")
+        chat.addNote(MyBundle.message("connected.model", model))
         tokenAgg.reset()
         updateTokenStatus()
         assistantStreaming = false
@@ -486,6 +469,10 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
     // Status bar updater
     private fun updateTokenStatus() {
         statusLabel.text = tokenAgg.formatted()
+    }
+
+    override fun dispose() {
+        try { session.removeListener(this) } catch (_: Throwable) {}
     }
 }
 
