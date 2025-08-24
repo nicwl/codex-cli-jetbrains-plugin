@@ -1,3 +1,6 @@
 [submodule "codex"]
 	path = codex
 	url = https://github.com/openai/codex.git
+[submodule "intellij-sdk-docs"]
+	path = intellij-sdk-docs
+	url = https://github.com/JetBrains/intellij-sdk-docs

@@ -1,6 +1,9 @@
+@file:OptIn(ExperimentalSerializationApi::class)
+
 package com.github.nicwl.codexclijetbrainsplugin.codex.protocol
 
 import com.github.nicwl.codexclijetbrainsplugin.codex.protocol.json.ExternalTagging
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement

@@ -12,44 +12,37 @@ import com.intellij.openapi.util.SystemInfo
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
-import com.intellij.ui.JBColor
-import com.intellij.ui.components.JBScrollPane
-import com.intellij.ui.EditorTextField
+import com.intellij.ui.TextFieldWithAutoCompletion
+import com.intellij.ui.TextFieldWithAutoCompletionListProvider
 import com.intellij.util.ui.JBUI
-import com.github.nicwl.codexclijetbrainsplugin.shared.CodexKeys
 import java.awt.BorderLayout
-import java.awt.Dimension
 import java.awt.event.InputEvent
 import java.awt.event.KeyEvent
 import com.intellij.codeInsight.lookup.LookupManager
 import com.intellij.codeInsight.lookup.LookupElementBuilder
-import com.intellij.codeInsight.completion.CodeCompletionHandlerBase
-import com.intellij.codeInsight.completion.CompletionType
+import com.intellij.codeInsight.AutoPopupController
 import com.intellij.openapi.editor.Editor
-import com.intellij.openapi.editor.EditorFactory
 import com.intellij.openapi.editor.ex.EditorEx
 import com.intellij.openapi.editor.EditorModificationUtil
 // keep single ApplicationManager import above
-import com.intellij.openapi.application.ModalityState
 import javax.swing.AbstractAction
 import javax.swing.JButton
 import javax.swing.JPanel
-import javax.swing.JScrollPane
 import javax.swing.JToolBar
 import javax.swing.JLabel
 import javax.swing.BoxLayout
-import java.awt.event.KeyAdapter
 import javax.swing.KeyStroke
-import com.intellij.openapi.editor.event.DocumentEvent
 import com.intellij.openapi.editor.event.DocumentListener
-import javax.swing.text.BadLocationException
+import com.intellij.openapi.editor.event.DocumentEvent
+import java.awt.KeyboardFocusManager
 import javax.swing.SwingUtilities
 
 class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
     private val log = Logger.getInstance(CodexToolWindowPanel::class.java)
     private val session = project.getService(CodexSessionService::class.java)
     private val chat = ChatView(project)
-    private val input = EditorTextField("", project, CodexChatFileType)
+    // Lazily initialize to ensure slashCommands is constructed first
+    private val input: TextFieldWithAutoCompletion<String> by lazy { createSlashAutoCompleteField() }
     private val statusLabel = JLabel("Tokens: total=0 input=0 (+ 0 cached) output=0 (reasoning 0)")
     private val tokenAgg = TokenAggregator()
     private var assistantStreaming = false
@@ -60,7 +53,6 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
     // no manual lookup state; rely on IDE completion
 
     private data class SlashCommand(val id: String, val title: String, val description: String, val needsArg: Boolean = false)
-    private var slashLookupRequested = false
     private val slashCommands = listOf(
         SlashCommand("compact", "Compact context", "Summarize and compress context for the next turns"),
         SlashCommand("status", "Show status", "Show Codex session status and model info"),
@@ -81,12 +73,11 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
         rootPanel.add(toolbar, BorderLayout.NORTH)
         rootPanel.add(chat, BorderLayout.CENTER)
 
-        // Configure chat input (EditorTextField) with soft wraps and keybindings
+        // Configure chat input (EditorTextField) with soft wraps and register Enter shortcut
         input.addSettingsProvider { ed ->
             (ed as? EditorEx)?.settings?.isUseSoftWraps = true
-            ed.putUserData(CodexKeys.CHAT_INPUT, true)
+            installEnterShortcut()
         }
-        installSlashCompletion()
         val inputPanel = JPanel(BorderLayout()).apply { border = JBUI.Borders.emptyTop(6) }
         val sendButton = JButton("Send").apply {
             addActionListener { sendCurrentInput() }
@@ -103,11 +94,11 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
         southStack.add(statusPanel)
         rootPanel.add(southStack, BorderLayout.SOUTH)
 
-        // Key bindings: Enter to send, Shift+Enter to insert newline
-        // Add Enter/Shift+Enter bindings to the editor component once it's created
-        SwingUtilities.invokeLater {
-            input.editor?.let { installEditorKeyBindings(it) }
-        }
+        // Ensure shortcut is registered even if settings provider didn't run yet
+        installEnterShortcut()
+
+        // Global key dispatcher as a reliable fallback to catch Enter within our input
+        installGlobalEnterDispatcher()
 
         // Interrupt keybindings
         val interruptAction = object : AbstractAction() {
@@ -157,79 +148,34 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
         session.startIfNeeded()
     }
 
-    private fun installSlashCompletion() {
-        // Show a Lookup with our slash commands when text is a single token starting with '/'
-        input.addDocumentListener(object : DocumentListener {
-            override fun documentChanged(event: DocumentEvent) {
-                val ed = input.editor ?: return
-                val txt = ed.document.text
-                val singleTokenSlash = txt.startsWith('/') && txt.indexOfFirst { it.isWhitespace() } < 0
-                log.warn("[slash] docChanged text='${txt.replace("\n", "\\n")}' singleToken=$singleTokenSlash")
-                val active = LookupManager.getActiveLookup(ed)
-                if (singleTokenSlash) {
-                    val prefix = txt.drop(1).lowercase()
-                    val items = if (prefix.isEmpty()) slashCommands else slashCommands.filter { it.id.startsWith(prefix) }
-                    if (items.isEmpty()) {
-                        if (active != null) LookupManager.getInstance(project).hideActiveLookup()
-                        slashLookupRequested = false
-                        return
-                    }
-                    if (!slashLookupRequested) {
-                        slashLookupRequested = true
-                        log.warn("[slash] scheduling lookup open after write; prefix='$prefix' items=${items.size}")
-                        ApplicationManager.getApplication().invokeLater({
-                            try {
-                                val stillEd = input.editor ?: return@invokeLater
-                                val current = stillEd.document.text
-                                val stillSingle = current.startsWith('/') && current.indexOfFirst { it.isWhitespace() } < 0
-                                val pfx = current.drop(1).lowercase()
-                                val list = if (pfx.isEmpty()) slashCommands else slashCommands.filter { it.id.startsWith(pfx) }
-                                val hasActive = LookupManager.getActiveLookup(stillEd) != null
-                                log.warn("[slash] invokeLater: stillSingle=$stillSingle hasActive=$hasActive filtered=${list.size}")
-                                if (stillSingle && list.isNotEmpty()) {
-                                    // Close any stale lookup then open a filtered one
-                                    if (hasActive) LookupManager.getInstance(project).hideActiveLookup()
-                                    showSlashLookup(stillEd, list)
-                                }
-                            } finally {
-                                slashLookupRequested = false
-                            }
-                        }, ModalityState.current())
-                    }
-                } else {
-                    if (active != null) {
-                        log.warn("[slash] hiding active lookup (not single token)")
-                        LookupManager.getInstance(project).hideActiveLookup()
-                    }
-                    slashLookupRequested = false
-                }
-            }
-        })
-    }
+    private fun createSlashAutoCompleteField(): TextFieldWithAutoCompletion<String> {
+        // Provide native auto-completion backed by a simple list provider.
+        val ids = slashCommands.map { it.id }
+        val provider = object : TextFieldWithAutoCompletionListProvider<String>(ids) {
+            override fun getLookupString(item: String): String = item
 
-    private fun showSlashLookup(editor: Editor, items: List<SlashCommand>) {
-        val elements = items.map { sc ->
-            val insert = "/${sc.id}" + if (sc.needsArg) " " else ""
-            // Use id as lookup string so typing filters by id; keep '/' only in presentation
-            LookupElementBuilder
-                .create(sc.id)
-                .withPresentableText("/${sc.id}")
-                .withTailText("  —  ${sc.title}", true)
-                .withTypeText(sc.description, true)
-                .withInsertHandler { ctx, _ ->
-                    // Default insertion replaces the prefix (e.g., 'sta' -> 'status'); prepend '/' if missing and add space for args
-                    val ed = ctx.editor
-                    val doc = ctx.document
-                    val caret = ed.caretModel.offset
-                    val text = doc.text
-                    val hasSlash = text.startsWith('/')
-                    // Ensure a leading slash exists
-                    if (!hasSlash) {
-                        doc.insertString(0, "/")
-                        ed.caretModel.moveToOffset(caret + 1)
-                    }
-                    // Add trailing space if needed
-                    if (sc.needsArg) {
+            override fun getPrefix(text: String, offset: Int): String? {
+                // Only trigger suggestions when the whole input is a single token starting with '/'
+                if (!text.startsWith('/')) return null
+                if (text.indexOfFirst { it.isWhitespace() } >= 0) return null
+                val end = offset.coerceAtMost(text.length)
+                val beforeCaret = text.substring(0, end)
+                // Prefix is the part after the leading slash
+                return beforeCaret.removePrefix("/")
+            }
+
+            override fun createLookupBuilder(item: String): LookupElementBuilder {
+                val sc = slashCommands.firstOrNull { it.id == item }
+                val builder = LookupElementBuilder.create(item)
+                    .withPresentableText("/$item")
+                    .withTailText(sc?.let { "  —  ${it.title}" } ?: "", true)
+                    .withTypeText(sc?.description ?: "", true)
+                return builder.withInsertHandler { ctx, _ ->
+                    // Add a trailing space for commands that require an argument.
+                    val needsArg = sc?.needsArg == true
+                    if (needsArg) {
+                        val ed = ctx.editor
+                        val doc = ctx.document
                         val pos = ed.caretModel.offset
                         val needsSpace = pos == doc.textLength || doc.charsSequence.getOrNull(pos) != ' '
                         if (needsSpace) {
@@ -238,8 +184,28 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
                         }
                     }
                 }
-        }.toTypedArray()
-        LookupManager.getInstance(project).showLookup(editor, *elements)
+            }
+        }
+        val field = TextFieldWithAutoCompletion(project, provider, false, null).apply { setOneLineMode(false) }
+        // Ensure auto-popup is enabled on typing (including when prefix is empty after '/')
+        TextFieldWithAutoCompletion.installCompletion(field.document, project, provider, true)
+        // Also trigger auto-popup immediately after a solitary '/' is typed
+        field.addDocumentListener(object : DocumentListener {
+            private var fired = false
+            override fun documentChanged(event: DocumentEvent) {
+                val ed = field.editor ?: return
+                val txt = ed.document.text
+                if (txt == "/") {
+                    if (!fired && LookupManager.getActiveLookup(ed) == null) {
+                        fired = true
+                        AutoPopupController.getInstance(project).scheduleAutoPopup(ed)
+                    }
+                } else {
+                    fired = false
+                }
+            }
+        })
+        return field
     }
 
     private fun sendCurrentInput() {
@@ -256,21 +222,53 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener {
         input.text = ""
     }
 
-    private fun installEditorKeyBindings(editor: Editor) {
-        val comp = editor.contentComponent
-        // Enter: send message
-        comp.inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), "codex-send")
-        comp.actionMap.put("codex-send", object : AbstractAction() {
-            override fun actionPerformed(e: java.awt.event.ActionEvent?) {
-                if (LookupManager.getActiveLookup(editor) != null) return
+    private fun installEnterShortcut() {
+        val comp = input as javax.swing.JComponent
+        if (comp.getClientProperty("codex-enter-shortcut-installed") == true) return
+        comp.putClientProperty("codex-enter-shortcut-installed", true)
+
+        val sendOnEnter = object : com.intellij.openapi.actionSystem.AnAction() {
+            override fun actionPerformed(e: com.intellij.openapi.actionSystem.AnActionEvent) {
+                val ed = input.editor
+                if (ed != null) {
+                    val lookup = LookupManager.getActiveLookup(ed)
+                    if (lookup != null) {
+                        val handler = com.intellij.openapi.editor.actionSystem.EditorActionManager
+                            .getInstance()
+                            .getActionHandler(com.intellij.openapi.actionSystem.IdeActions.ACTION_CHOOSE_LOOKUP_ITEM)
+                        handler.execute(ed, null, e.dataContext)
+                        return
+                    }
+                }
                 sendCurrentInput()
             }
-        })
-        // Shift+Enter: insert newline
-        comp.inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, InputEvent.SHIFT_DOWN_MASK), "codex-insert-break")
-        comp.actionMap.put("codex-insert-break", object : AbstractAction() {
-            override fun actionPerformed(e: java.awt.event.ActionEvent?) { EditorModificationUtil.insertStringAtCaret(editor, "\n") }
-        })
+        }
+        val shortcut = com.intellij.openapi.actionSystem.KeyboardShortcut(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), null)
+        sendOnEnter.registerCustomShortcutSet(com.intellij.openapi.actionSystem.CustomShortcutSet(shortcut), comp)
+    }
+
+    private fun installGlobalEnterDispatcher() {
+        if (rootPanel.getClientProperty("codex-enter-dispatcher-installed") == true) return
+        rootPanel.putClientProperty("codex-enter-dispatcher-installed", true)
+        val dispatcher = java.awt.KeyEventDispatcher { e ->
+            if (e.id != java.awt.event.KeyEvent.KEY_PRESSED) return@KeyEventDispatcher false
+            if (e.keyCode != KeyEvent.VK_ENTER) return@KeyEventDispatcher false
+            val focus = KeyboardFocusManager.getCurrentKeyboardFocusManager().focusOwner
+            if (focus == null || !SwingUtilities.isDescendingFrom(focus, input)) return@KeyEventDispatcher false
+            val ed = input.editor
+            val lookupActive = ed != null && LookupManager.getActiveLookup(ed) != null
+            val shift = (e.modifiersEx and InputEvent.SHIFT_DOWN_MASK) != 0
+            if (!lookupActive && !shift) {
+                sendCurrentInput()
+                true
+            } else if (!lookupActive && shift) {
+                if (ed != null) EditorModificationUtil.insertStringAtCaret(ed, "\n")
+                true
+            } else {
+                false
+            }
+        }
+        KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(dispatcher)
     }
 
     private fun handleSlashCommand(raw: String): Boolean {
