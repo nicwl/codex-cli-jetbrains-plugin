@@ -46,6 +46,7 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener, D
     private val log = Logger.getInstance(CodexToolWindowPanel::class.java)
     private val session = project.getService(CodexSessionService::class.java)
     private val chat = ChatView(project)
+    private val workingIndicator = WorkingIndicator { session.sendInterrupt() }
     // Lazily initialize to ensure slashCommands is constructed first
     private val input: TextFieldWithAutoCompletion<String> by lazy { createSlashAutoCompleteField() }
     private val statusLabel = JLabel(MyBundle.message("status.tokens.initial"))
@@ -76,6 +77,8 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener, D
 
         val toolbar = createToolbar()
         rootPanel.add(toolbar, BorderLayout.NORTH)
+        // Install overlay indicator onto the chat view for floating bottom rendering
+        chat.setWorkingIndicator(workingIndicator)
         rootPanel.add(chat, BorderLayout.CENTER)
 
         // Configure chat input (EditorTextField) with soft wraps and register Enter shortcut
@@ -112,6 +115,12 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener, D
         val im = rootPanel.getInputMap(javax.swing.JComponent.WHEN_ANCESTOR_OF_FOCUSED_COMPONENT)
         val inputIm = input.getInputMap(javax.swing.JComponent.WHEN_FOCUSED)
         input.actionMap.put("codex-interrupt", interruptAction)
+        // Add Esc to match TUI hint and provide a universal interrupt key
+        run {
+            val ksEsc = javax.swing.KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0)
+            im.put(ksEsc, "codex-interrupt")
+            inputIm.put(ksEsc, "codex-interrupt")
+        }
         if (SystemInfo.isMac) {
             // macOS: Ctrl+C
             val ks = javax.swing.KeyStroke.getKeyStroke(KeyEvent.VK_C, InputEvent.CTRL_DOWN_MASK)
@@ -219,6 +228,8 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener, D
             }
         }
         chat.addUserMessage(text)
+        // Show working indicator immediately for responsiveness
+        if (!workingIndicator.isActive()) workingIndicator.start()
         session.sendUserText(text)
         input.text = ""
     }
@@ -396,7 +407,10 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener, D
         chat.appendAssistantDelta(delta)
     }
 
-    override fun onBackground(message: String) { chat.addNote(message) }
+    override fun onBackground(message: String) {
+        workingIndicator.updateText(message)
+        chat.addNote(message)
+    }
 
     override fun onTokenUsage(summary: String) {
         tokenAgg.ingestSummary(summary)
@@ -404,34 +418,25 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener, D
     }
 
     override fun onExecApprovalRequest(submissionId: String, command: List<String>, cwd: String, reason: String?) {
-        val options = arrayOf("Approve", "Approve for Session", "Deny", "Abort")
-        val choice = com.intellij.openapi.ui.Messages.showIdeaMessageDialog(
-            project,
-            "Command:\n${command.joinToString(" ")}\nCWD: $cwd${reason?.let { "\nReason: $it" } ?: ""}",
-            "Codex Command Approval",
-            options,
-            0,
-            null,
-            null)
-        when (choice) {
-            0 -> session.sendExecApproval("approved", submissionId)
-            1 -> session.sendExecApproval("approved_for_session", submissionId)
-            2 -> session.sendExecApproval("denied", submissionId)
-            3 -> session.sendExecApproval("abort", submissionId)
-        }
+        chat.addExecApprovalPrompt(
+            command = command,
+            cwd = cwd,
+            reason = reason,
+            onApprove = { session.sendExecApproval("approved", submissionId) },
+            onApproveSession = { session.sendExecApproval("approved_for_session", submissionId) },
+            onDeny = { session.sendExecApproval("denied", submissionId) },
+            onAbort = { session.sendExecApproval("abort", submissionId) },
+        )
     }
 
     override fun onPatchApprovalRequest(submissionId: String, summary: String) {
-        val options = arrayOf("Approve", "Approve for Session", "Deny", "Abort")
-        val choice = com.intellij.openapi.ui.Messages.showIdeaMessageDialog(
-            project, "Proposed changes:\n$summary", "Codex Patch Approval", options, 0, null, null
+        chat.addPatchApprovalPrompt(
+            summary = summary,
+            onApprove = { session.sendPatchApproval("approved", submissionId) },
+            onApproveSession = { session.sendPatchApproval("approved_for_session", submissionId) },
+            onDeny = { session.sendPatchApproval("denied", submissionId) },
+            onAbort = { session.sendPatchApproval("abort", submissionId) },
         )
-        when (choice) {
-            0 -> session.sendPatchApproval("approved", submissionId)
-            1 -> session.sendPatchApproval("approved_for_session", submissionId)
-            2 -> session.sendPatchApproval("denied", submissionId)
-            3 -> session.sendPatchApproval("abort", submissionId)
-        }
     }
 
     override fun onTurnDiff(unifiedDiff: String) { chat.addDiff(unifiedDiff) }
@@ -473,6 +478,15 @@ class CodexToolWindowPanel(private val project: Project) : CodexEventListener, D
 
     override fun dispose() {
         try { session.removeListener(this) } catch (_: Throwable) {}
+    }
+
+    // Task lifecycle for working indicator
+    override fun onTaskStarted() {
+        if (!workingIndicator.isActive()) workingIndicator.start()
+    }
+
+    override fun onTaskComplete(lastAgentMessage: String?) {
+        workingIndicator.stop()
     }
 }
 

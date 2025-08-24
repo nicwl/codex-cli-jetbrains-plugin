@@ -24,6 +24,9 @@ import javax.swing.SwingUtilities
 
 interface CodexEventListener {
     fun onConnected(model: String) {}
+    // Task lifecycle
+    fun onTaskStarted() {}
+    fun onTaskComplete(lastAgentMessage: String?) {}
     fun onAgentMessage(text: String) {}
     fun onAgentMessageDelta(delta: String) {}
     fun onBackground(message: String) {}
@@ -126,6 +129,8 @@ class CodexSessionService(private val project: Project) : Disposable, CodexTrans
         val id = ev.id
         when (val msg = ev.msg) {
             is EventMsg.TaskComplete -> {
+                // Notify listeners that the task completed (for UI state like working indicator)
+                listeners.forEach { l -> safeSwing { l.onTaskComplete(msg.lastAgentMessage) } }
                 // Notify the user appropriately:
                 // - If IDE is focused and the Codex tool window is visible, do nothing (the UI already shows it)
                 // - If IDE is focused but tool window is hidden, show an in-IDE balloon
@@ -166,6 +171,8 @@ class CodexSessionService(private val project: Project) : Disposable, CodexTrans
                 }
             }
             is EventMsg.TaskStarted -> {
+                // Signal start of a new agent turn to listeners
+                listeners.forEach { l -> safeSwing { l.onTaskStarted() } }
                 sawTextDelta = false
                 sawReasoningDelta = false
                 lastFullAgentMessage = null
@@ -351,6 +358,11 @@ class CodexSessionService(private val project: Project) : Disposable, CodexTrans
 
             is EventMsg.Error -> {
                 listeners.forEach { l -> safeSwing { l.onError(msg.message) } }
+            }
+            is EventMsg.TurnAborted -> {
+                // Hide any working indicators on user interrupt or replacement.
+                // Treat both as end-of-turn for UI purposes.
+                listeners.forEach { l -> safeSwing { l.onTaskComplete(null) } }
             }
             else -> { /* ignore unhandled */ }
         }

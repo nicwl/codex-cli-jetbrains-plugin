@@ -9,6 +9,8 @@ import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.components.JBScrollBar
 import com.intellij.util.ui.JBUI
+import javax.swing.plaf.LayerUI
+import javax.swing.JLayer
 import java.awt.*
 import java.awt.event.ComponentAdapter
 import java.awt.event.ComponentEvent
@@ -17,16 +19,47 @@ import javax.swing.*
 class ChatView(private val project: Project) : JPanel(BorderLayout()) {
     private val content = JPanel()
     private val scroll = JBScrollPane(content, ScrollPaneConstants.VERTICAL_SCROLLBAR_ALWAYS, ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER)
+    private val overlayUi = object : LayerUI<JComponent>() {
+        override fun paint(g: Graphics, c: JComponent) {
+            super.paint(g, c)
+            val indicator = overlayIndicator ?: return
+            if (!indicator.isActive()) return
+
+            val g2 = g.create() as Graphics2D
+            try {
+            val margin = JBUI.scale(8)
+            val vsb = scroll.verticalScrollBar
+            val sbw = if (vsb != null && vsb.isVisible) vsb.width else 0
+            val maxWidth = (c.width - margin * 2 - sbw).coerceAtLeast(100)
+            val pref = indicator.preferredSize
+            // Use full available width within margins so inner padding/insets are respected
+            val w = maxWidth
+            // Height should include indicator padding/insets
+            val h = pref.height
+            val x = margin
+            val y = c.height - margin - h
+            val clip = g2.create(x, y, w, h)
+            indicator.setSize(w, h)
+            indicator.paint(clip)
+                clip.dispose()
+            } finally {
+                g2.dispose()
+            }
+        }
+    }
+    private val layered = JLayer<JComponent>(scroll, overlayUi)
+    private var overlayIndicator: WorkingIndicator? = null
 
     private var currentAssistant: MessageBubble? = null
     private var currentReasoning: MessageBubble? = null
     private val execConsoles = mutableMapOf<String, ConsoleBubble>()
+    private val approvals = mutableListOf<ApprovalBubble>()
     private val bubbles = mutableListOf<MessageBubble>()
 
     init {
         content.layout = BoxLayout(content, BoxLayout.Y_AXIS)
         content.border = JBUI.Borders.empty(8)
-        add(scroll, BorderLayout.CENTER)
+        add(layered, BorderLayout.CENTER)
 
         // Use custom ScrollBar UI to keep thumbs always visible (avoid macOS overlay auto-hide)
         scroll.verticalScrollBar = JBScrollBar(Adjustable.VERTICAL).apply {
@@ -46,6 +79,12 @@ class ChatView(private val project: Project) : JPanel(BorderLayout()) {
                 updateBubbleWidths()
             }
         })
+    }
+
+    fun setWorkingIndicator(indicator: WorkingIndicator) {
+        overlayIndicator = indicator
+        indicator.setRepaintTarget(layered)
+        layered.repaint()
     }
 
     fun addUserMessage(text: String) {
@@ -223,6 +262,7 @@ class ChatView(private val project: Project) : JPanel(BorderLayout()) {
         val available = (containerW * 0.9).toInt().coerceAtLeast(200)
         bubbles.forEach { it.setMaxWidth(available) }
         execConsoles.values.forEach { it.setMaxWidth(available) }
+        approvals.forEach { it.setMaxWidth(available) }
         content.revalidate()
         content.repaint()
     }
@@ -231,6 +271,150 @@ class ChatView(private val project: Project) : JPanel(BorderLayout()) {
         val containerW = scroll.viewport.extentSize.width.takeIf { it > 0 } ?: content.width
         val available = (containerW * 0.9).toInt().coerceAtLeast(200)
         b.setMaxWidth(available)
+    }
+
+    // ───────── Approval prompt bubble ─────────
+    fun addExecApprovalPrompt(
+        command: List<String>,
+        cwd: String,
+        reason: String?,
+        onApprove: () -> Unit,
+        onApproveSession: () -> Unit,
+        onDeny: () -> Unit,
+        onAbort: () -> Unit,
+    ) {
+        val message = buildString {
+            append("Command: ")
+            append(command.joinToString(" "))
+            append('\n')
+            append("CWD: ")
+            append(cwd)
+            if (!reason.isNullOrBlank()) {
+                append('\n')
+                append("Reason: ")
+                append(reason)
+            }
+        }
+        val bubble = ApprovalBubble("Codex Command Approval", message, onApprove, onApproveSession, onDeny, onAbort)
+        approvals.add(bubble)
+        content.add(bubble.row)
+        revalidateAndScroll()
+    }
+
+    fun addPatchApprovalPrompt(
+        summary: String,
+        onApprove: () -> Unit,
+        onApproveSession: () -> Unit,
+        onDeny: () -> Unit,
+        onAbort: () -> Unit,
+    ) {
+        val bubble = ApprovalBubble("Codex Patch Approval", "Proposed changes:\n$summary", onApprove, onApproveSession, onDeny, onAbort)
+        approvals.add(bubble)
+        content.add(bubble.row)
+        revalidateAndScroll()
+    }
+
+    inner class ApprovalBubble(
+        title: String,
+        message: String,
+        onApprove: () -> Unit,
+        onApproveSession: () -> Unit,
+        onDeny: () -> Unit,
+        onAbort: () -> Unit,
+    ) {
+        val row = JPanel()
+        private val panel = JPanel(BorderLayout())
+        private val inner = JPanel(BorderLayout())
+        private val header = JLabel(title)
+        private val text = JTextArea(message)
+        private val buttons = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(8), 0))
+        private val approveBtn = JButton("Approve")
+        private val approveSessBtn = JButton("Approve for Session")
+        private val denyBtn = JButton("Deny")
+        private val abortBtn = JButton("Abort")
+
+        init {
+            row.isOpaque = false
+            row.layout = BoxLayout(row, BoxLayout.X_AXIS)
+
+            val bg = JBColor(0xFFFBE6, 0x3A3F44)
+            inner.background = bg
+            inner.border = JBUI.Borders.compound(
+                JBUI.Borders.customLine(JBColor.border(), 1),
+                JBUI.Borders.empty(8, 10)
+            )
+
+            header.foreground = UIManager.getColor("Label.foreground")
+            header.font = Font(Font.SANS_SERIF, Font.BOLD, UIManager.getFont("Label.font").size)
+            header.border = JBUI.Borders.emptyBottom(6)
+
+            text.isEditable = false
+            text.lineWrap = true
+            text.wrapStyleWord = true
+            text.background = bg
+            text.foreground = UIManager.getColor("Label.foreground")
+
+            buttons.isOpaque = false
+            buttons.border = JBUI.Borders.emptyTop(8)
+
+            val onDecision: (String, () -> Unit) -> Unit = { label, action ->
+                approveBtn.isEnabled = false
+                approveSessBtn.isEnabled = false
+                denyBtn.isEnabled = false
+                abortBtn.isEnabled = false
+                // Replace buttons with decision label
+                buttons.removeAll()
+                buttons.add(JLabel("Decision: $label"))
+                buttons.revalidate()
+                buttons.repaint()
+                action.invoke()
+            }
+
+            approveBtn.addActionListener { onDecision("Approved", onApprove) }
+            approveSessBtn.addActionListener { onDecision("Approved for Session", onApproveSession) }
+            denyBtn.addActionListener { onDecision("Denied", onDeny) }
+            abortBtn.addActionListener { onDecision("Aborted", onAbort) }
+
+            buttons.add(approveBtn)
+            buttons.add(approveSessBtn)
+            buttons.add(denyBtn)
+            buttons.add(abortBtn)
+
+            val center = JPanel(BorderLayout())
+            center.isOpaque = false
+            center.add(header, BorderLayout.NORTH)
+            center.add(text, BorderLayout.CENTER)
+            center.add(buttons, BorderLayout.SOUTH)
+
+            panel.isOpaque = false
+            panel.add(inner, BorderLayout.WEST)
+            inner.add(center, BorderLayout.CENTER)
+            panel.border = JBUI.Borders.empty(4, 0)
+            panel.alignmentX = Component.LEFT_ALIGNMENT
+
+            row.add(panel)
+            row.add(Box.createHorizontalGlue())
+        }
+
+        fun setMaxWidth(maxWidth: Int) {
+            val innerInsets = inner.border?.getBorderInsets(inner) ?: Insets(0, 0, 0, 0)
+            val panelInsets = panel.border?.getBorderInsets(panel) ?: Insets(0, 0, 0, 0)
+
+            val bubbleWidth = maxWidth
+            val wrapWidth = (bubbleWidth - innerInsets.left - innerInsets.right).coerceAtLeast(60)
+            text.size = Dimension(wrapWidth, 100_000)
+            val textH = text.preferredSize.height
+
+            val buttonsH = buttons.preferredSize.height
+            val headerH = header.preferredSize.height
+            val totalH = headerH + textH + buttonsH + innerInsets.top + innerInsets.bottom + panelInsets.top + panelInsets.bottom + JBUI.scale(1)
+
+            panel.preferredSize = Dimension(bubbleWidth, totalH)
+            panel.maximumSize = Dimension(bubbleWidth, totalH)
+            row.maximumSize = Dimension(Int.MAX_VALUE, totalH)
+            panel.revalidate()
+            panel.repaint()
+        }
     }
 
     private fun refreshConsole(c: ConsoleBubble) {
